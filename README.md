@@ -6,16 +6,15 @@ Self-hosted web and AI crawler analytics for Generative Engine Optimization (GEO
 
 **Jointly published by 猎看科技 · 北京日报社智源GEO**
 
-[Quick start](docs/getting-started.md) · [Deployment](docs/deployment.md) · [AI crawler analytics](docs/ai-crawler-analytics.md) · [Architecture](docs/system-overview.md) · [Documentation](docs/README.md) · [Contributing](CONTRIBUTING.md)
+[Quick start](docs/getting-started.en.md) · [Deployment](docs/deployment.en.md) · [AI crawler analytics](docs/ai-crawler-analytics.md) · [Architecture](docs/system-overview.md) · [Documentation](docs/README.md) · [Contributing](CONTRIBUTING.md)
 
 GEOInflow brings website visitors, AI search referrals, server crawl logs, and content inventories into a shared website context. It helps teams understand which AI crawlers visit their sites, which pages they request, which important pages have no observed crawl activity, where requests fail, and how AI search contributes visitors and conversions.
 
 The system includes browser tracking, account permissions, GEO reports, crawler evidence, log collection, and analytics acceleration. The current product version is **v1.2**, with build version **1.2.0**. Application source code is distributed under the [MIT license](LICENSE).
 
-The detailed guides linked from this overview are currently in Simplified Chinese.
+Quick start and deployment guides are available in English and Simplified Chinese. Other linked reference guides are currently in Simplified Chinese.
 
 ## Introduction video
-
 
 https://github.com/user-attachments/assets/81e57cc4-3441-4e5f-b2fb-cd929c6c27bd
 
@@ -124,7 +123,7 @@ The example is named “猎看官网（示例数据）”. It initializes from t
 
 Production access requires a domain, HTTPS, and a trusted reverse proxy. Browser PV collection can continue without a trusted IP ingress, while identity metrics such as UV require reliable ingress evidence. Automatic log ingestion and optional AI analysis have separate configuration requirements.
 
-The [deployment guide](docs/deployment.md) covers services, configuration, proxies, backups, and upgrades. The [quick start](docs/getting-started.md) explains how to connect the first website.
+The [deployment guide](docs/deployment.en.md) covers services, configuration, proxies, backups, and upgrades. The [quick start](docs/getting-started.en.md) explains how to connect the first website.
 
 ## Keeping analytics current
 
@@ -146,7 +145,7 @@ Initial calculations, cache hits, and background updates have different costs. A
 
 ## Development and maintenance
 
-Development uses Node.js **22.23.3**, pnpm **12.3.4**, and PostgreSQL. Prepare an independent database and private configuration using the [deployment guide](docs/deployment.md), then run the following commands. This example uses the separate development port `3302`:
+Development uses Node.js **22.23.3**, pnpm **12.3.4**, and PostgreSQL. Prepare an independent database and private configuration using the [deployment guide](docs/deployment.en.md), then run the following commands. This example uses the separate development port `3302`:
 
 ```sh
 pnpm install --frozen-lockfile
