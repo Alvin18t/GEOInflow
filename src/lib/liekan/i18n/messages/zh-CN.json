@@ -4852,5 +4852,10 @@
   "m_0e6559d1d451": "登录身份已变更，请重新读取偏好",
   "m_daf6bb24bf30": "{v0}创始人，《{v1}》作者，{v2}发起人",
   "m_28dffd64f8bb": "知名AI自媒体，《{v0}》作者，{v1}发起人",
-  "m_42a0068ac7ed": "{v0}负责人，{v1}副总经理"
+  "m_42a0068ac7ed": "{v0}负责人，{v1}副总经理",
+  "m_2e3e747f933d": "当前 Cloudflare 账户尚未启用所需的 Logpush 能力，请核对启用与计费，或改用服务器采集。",
+  "m_24165ab98197": "Cloudflare 授权缺少日志管理权限，请核对 Zone Logs 权限后重新连接。",
+  "m_d2a4d220dc46": "Cloudflare OAuth 权限配置无效",
+  "m_d3da5e85ecaf": "Cloudflare 账户尚未启用所需的 Logpush 能力",
+  "m_c4627cf414b5": "Cloudflare 授权缺少所需权限"
 }

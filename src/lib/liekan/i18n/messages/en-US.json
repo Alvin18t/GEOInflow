@@ -4852,5 +4852,10 @@
   "m_0e6559d1d451": "The signed-in account has changed. Reload preferences.",
   "m_daf6bb24bf30": "Founder of {v0}; author of {v1}; initiator of {v2}",
   "m_28dffd64f8bb": "Prominent AI content creator; author of {v0}; initiator of {v1}",
-  "m_42a0068ac7ed": "Head of {v0}; Deputy General Manager of {v1}"
+  "m_42a0068ac7ed": "Head of {v0}; Deputy General Manager of {v1}",
+  "m_2e3e747f933d": "The current Cloudflare account has not enabled the required Logpush capability. Check enablement and billing, or use server collection.",
+  "m_24165ab98197": "Cloudflare authorization is missing log management permissions. Check Zone Logs permissions, then reconnect.",
+  "m_d2a4d220dc46": "Invalid Cloudflare OAuth scope configuration",
+  "m_d3da5e85ecaf": "The Cloudflare account has not enabled the required Logpush capability",
+  "m_c4627cf414b5": "Cloudflare authorization is missing required permissions"
 }
