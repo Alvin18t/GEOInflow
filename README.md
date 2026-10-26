@@ -16,7 +16,8 @@ The detailed guides linked from this overview are currently in Simplified Chines
 
 ## Introduction video
 
-https://github.com/user-attachments/assets/2fc24a2c-b8d1-4bb2-ad4d-1229eb1c4796
+
+https://github.com/user-attachments/assets/81e57cc4-3441-4e5f-b2fb-cd929c6c27bd
 
 ## What you can use it for
 
