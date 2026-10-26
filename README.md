@@ -1,5 +1,3 @@
-
-
 # GEOInflow
 
 面向 GEO 的自托管网站与 AI 爬虫分析系统。
@@ -8,11 +6,13 @@
 
 [快速开始](docs/getting-started.md) · [部署指南](docs/deployment.md) · [AI 爬虫分析](docs/ai-crawler-analytics.md) · [系统架构](docs/system-overview.md) · [文档目录](docs/README.md) · [参与贡献](CONTRIBUTING.md)
 
-
-https://github.com/user-attachments/assets/2fc24a2c-b8d1-4bb2-ad4d-1229eb1c4796
-。
+GEOInflow 将网站访客、AI 搜索引荐、服务器抓取日志和内容目录放在同一个网站上下文中，帮助团队回答这些问题：哪些 AI 蜘蛛访问了网站，访问了哪些内容，哪些关键页面长期缺少抓取记录，访问是否遇到错误，以及 AI 搜索实际带来了多少访客和转化。
 
 GEOInflow 提供浏览采集、账号权限、GEO 统计界面、爬虫证据、日志采集和统计加速。当前产品版本为 **v1.2**，工程版本为 **1.2.0**。应用源码采用 [MIT 许可证](LICENSE)。
+
+## 产品介绍视频
+
+https://github.com/user-attachments/assets/2fc24a2c-b8d1-4bb2-ad4d-1229eb1c4796
 
 ## 用它做什么
 
