@@ -211,7 +211,9 @@ export async function followAnalysisJob(
       if (['failed', 'invalidated', 'expired'].includes(job.status)) {
         const error: any = new Error(
           job.status === 'failed'
-            ? '后台统计计算失败，请缩小范围或重试'
+            ? job.errorCode === 'analysis-capacity-limited'
+              ? '统计缓存容量不足，请在统计加速中查看存储与清理'
+              : '后台统计计算失败，请缩小范围或重试'
             : '统计条件已变化，请重新读取',
         );
         error.status = job.status === 'failed' ? 503 : 410;

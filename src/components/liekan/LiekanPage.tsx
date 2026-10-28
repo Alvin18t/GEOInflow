@@ -962,12 +962,15 @@ export function LiekanPage({ resource }: { resource: Resource }) {
       <div className={styles.analysisTools}>
         {report?.meta.snapshot && (
           <span>
-            {i18n.text('数据截至 {v0}，后台每 30 秒更新', [
+            {i18n.text('数据截至 {v0}，后台每 30 秒检查更新', [
               new Date(report.meta.snapshot.dataThrough).toLocaleString(i18n.locale, {
                 timeZone: report.range.timezone,
                 hour12: false,
               }),
             ])}
+            {report.meta.snapshot.updateError && (
+              <span role="status"> · {i18n.text('更新失败，当前显示上次读取的数据')}</span>
+            )}
           </span>
         )}
         {resource === 'logs' && (

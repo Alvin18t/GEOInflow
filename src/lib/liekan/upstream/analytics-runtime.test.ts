@@ -453,6 +453,61 @@ it('sets real SQL timeouts before execution and releases concurrency after the t
   await running;
   expect(gate.state.active).toBe(0);
 });
+it.each([
+  'metadata-acquisition',
+  'metadata-statements',
+  'compute-acquisition',
+  'early-statement',
+  'expired-transaction',
+  'expired-statement',
+  'expired-before-statement',
+])('preserves the runtime retry classification for %s', async phase => {
+  vi.useFakeTimers({ toFake: ['Date'] });
+  vi.setSystemTime(1000);
+  const cache = new QueryCache();
+  const failure = Object.assign(
+    new Error(
+      phase === 'expired-statement'
+        ? 'canceling statement due to statement timeout'
+        : 'Unable to start a transaction in the given time',
+    ),
+    phase === 'expired-statement' ? { code: 'P2010', meta: { code: '57014' } } : { code: 'P2028' },
+  );
+  const provider = () => ({
+    $transaction: async (work: (tx: unknown) => Promise<unknown>, options: any) => {
+      if (
+        phase === 'metadata-acquisition' ||
+        (phase === 'compute-acquisition' && options.isolationLevel === 'RepeatableRead')
+      )
+        throw failure;
+      return primary().$transaction(async tx => {
+        if (phase === 'metadata-statements') {
+          const query = tx.$queryRawUnsafe;
+          tx.$queryRawUnsafe = async (statement: string) => {
+            const result = await query(statement);
+            if (statement.includes('FROM liekan_analytics_revision')) vi.setSystemTime(6001);
+            return result;
+          };
+        }
+        return work(tx);
+      }, options);
+    },
+  });
+  installAnalyticsRuntime(cache, provider, disabled());
+  const load = vi.fn(async () => {
+    if (phase.startsWith('expired-')) vi.setSystemTime(61001);
+    if (phase === 'expired-before-statement') return getQuerySnapshot().$queryRawUnsafe('SELECT 1');
+    throw failure;
+  });
+  await expect(cache.read('runtime-timeout-' + phase, 30000, tags, load)).rejects.toMatchObject({
+    status: 503,
+    code: phase.startsWith('expired-') ? 'analysis-query-timeout' : 'liekan-error',
+  });
+  expect(load).toHaveBeenCalledTimes(
+    phase.startsWith('metadata-') || phase.endsWith('acquisition') ? 0 : 1,
+  );
+  expect(analyticsGate.state).toEqual({ active: 0, queued: 0 });
+});
 it.each(['leader', 'joined'])(
   'checks each consumer when the %s membership is removed during shared computation',
   async victim => {
@@ -502,6 +557,37 @@ it.each(['leader', 'joined'])(
     expect(currentCacheContext()).toBeUndefined();
   },
 );
+it('keeps a joined-reader wait timeout transient while the producer can still finish', async () => {
+  vi.useFakeTimers();
+  const cache = new QueryCache();
+  installAnalyticsRuntime(cache, primary, disabled());
+  let release!: () => void, started!: () => void;
+  const held = new Promise<void>(resolve => (release = resolve));
+  const entered = new Promise<void>(resolve => (started = resolve));
+  const load = vi.fn(async () => {
+    started();
+    await held;
+    return 7;
+  });
+  const producer = analyticsWorkerContext(id, { private: true }, () =>
+    cache.read('joined-wait', 30000, tags, load),
+  );
+  await entered;
+  try {
+    const waiting = analyticsWorkerContext(
+      id,
+      { private: true },
+      () => cache.read('joined-wait', 30000, tags, load),
+      { deadline: Date.now() + 30 },
+    ).catch(error => error);
+    await vi.advanceTimersByTimeAsync(30);
+    expect(await waiting).toMatchObject({ status: 503, code: 'liekan-error' });
+    expect(load).toHaveBeenCalledOnce();
+  } finally {
+    release();
+    expect((await producer).value).toBe(7);
+  }
+});
 it('coalesces manual refreshes across instances and applies the actor cooldown across instances', async () => {
   const redis = new MemoryRedis(''),
     first = new QueryCache(),

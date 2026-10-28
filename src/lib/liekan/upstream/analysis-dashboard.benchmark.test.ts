@@ -10,6 +10,10 @@ import { hashSync } from 'bcryptjs';
 import { Client } from 'pg';
 import { it } from 'vitest';
 import {
+  readBenchmarkDemand,
+  type BenchmarkCohort,
+} from '../../../../scripts/liekan-dashboard-drain';
+import {
   benchmarkBrowserHeaders,
   seedBenchmarkBrowserEvidence,
 } from '../../../../scripts/liekan-benchmark-fixtures';
@@ -1086,18 +1090,16 @@ it.skipIf(!enabled)(
       const start = performance.now();
       let first: any[] = [],
         current: any[] = [];
+      let cohort: BenchmarkCohort;
       do {
-        current = (
-          await native.query(
-            `SELECT q.id,q.website_id,q.status,q.target,q.parameters->>'resource' AS resource,q.attempts,q.next_attempt_at
-          FROM liekan_analysis_query q WHERE q.status IN('queued','running') AND q.retention_until>clock_timestamp()
-           AND (q.website_id=ANY($2::uuid[]) OR EXISTS(SELECT 1 FROM liekan_analysis_query_consumer c WHERE c.job_id=q.id AND c.actor_id=ANY($1::uuid[])))
-          UNION ALL SELECT b.id,b.website_id,b.status,'build',b.family,b.attempts,b.next_attempt_at FROM liekan_analysis_build b
-           WHERE $3::boolean AND b.website_id=ANY($2::uuid[]) AND b.status IN('queued','running')`,
-            [consumers, sites, includeBuilds],
-          )
-        ).rows;
-        if (!first.length) first = current;
+        current = await readBenchmarkDemand(native, consumers, sites, includeBuilds, cohort);
+        if (!cohort) {
+          first = current;
+          cohort = {
+            queries: first.filter(row => row.target !== 'build').map(row => row.id),
+            builds: first.filter(row => row.target === 'build').map(row => row.id),
+          };
+        }
         if (!current.length) break;
         await pause(200);
       } while (performance.now() - start < 120000);
@@ -1107,6 +1109,9 @@ it.skipIf(!enabled)(
         waitedMs: performance.now() - start,
         initial: first,
         remaining: current,
+        ongoingMaintenance: (
+          await readBenchmarkDemand(native, consumers, sites, includeBuilds)
+        ).filter(row => !current.some(pending => pending.id === row.id)),
       });
       await saveReport();
       assert.equal(current.length, 0, `owned consumers did not naturally drain before ${stage}`);
@@ -2253,15 +2258,14 @@ it.skipIf(!enabled)(
           [sites.slice(1, 3)],
         );
         await drainConsumers(`${distribution}:after-ten-cold-burst`);
-        // Start a separate growth stage after the burst and both bounded background builds finish.
-        // Each arm uses the same core inputs and natural empty-queue boundary; no quota is changed.
+        // Settle registered readers, builds and descendants while automatic maintenance continues.
         await drainConsumers(`${distribution}:history-growth-isolated-start`, sites, true);
         const growthHttpBefore: Record<string, any> = {};
         entry.historyGrowthHttp = {};
         entry.historyGrowthStage = {
           startedAt: new Date().toISOString(),
           loadCondition:
-            'Adjacent before/after arms in this stage; owned reader and build queues naturally drained at arm boundaries. Buffers stay warm.',
+            'Adjacent before/after arms use the same inputs; registered readers, builds and descendants settle at arm boundaries. Continuing automatic maintenance is recorded. Buffers stay warm.',
         };
         for (const p of combinations.slice(0, 2)) {
           await drainConsumers(`${distribution}:${p.resource}:growth-before-arm`, sites, true);

@@ -23,6 +23,8 @@ import {
   dashboardAnalysisWorkSql,
   dashboardRunnableHeadSql,
   pauseIdleDashboardRetries,
+  preserveDashboardFailure,
+  yieldIdleDashboard,
 } from './dashboard-demand';
 import {
   analysisDigest,
@@ -135,6 +137,8 @@ async function requestAnalysisQueryOnce(
   input: Record<string, unknown>,
   locale: 'zh-CN' | 'en-US' = 'zh-CN',
   registered?: AnalysisRegistration,
+  foreground = true,
+  admissionDeadline = Infinity,
 ) {
   const parameters = analysisQueryParameters(target, input),
     forced = input.refresh === '1';
@@ -186,6 +190,12 @@ async function requestAnalysisQueryOnce(
       );
       if (consumer.length) {
         await registered?.(tx, existing);
+        const [current] = await tx.$queryRawUnsafe<{ id: string }[]>(
+          "SELECT id FROM liekan_analysis_query WHERE id=$1::uuid AND status IN('queued','running') FOR SHARE SKIP LOCKED",
+          existing.id,
+        );
+        if (!current)
+          throw new LiekanError('统计任务已更新，请重试登记', 503, 'analysis-admission-busy');
         const previous = rows.find(row => row.status === 'ready');
         return {
           ready: false as const,
@@ -194,20 +204,65 @@ async function requestAnalysisQueryOnce(
         };
       }
     }
+    const activeNow = async () =>
+      (
+        await tx.$queryRawUnsafe<Row[]>(
+          `SELECT * FROM liekan_analysis_query WHERE website_id=$1::uuid AND query_key=$2 AND status IN('queued','running') AND retention_until>clock_timestamp() AND ($3=false OR (forced AND actor_id=$4::uuid AND queued_at>clock_timestamp()-interval '5 seconds')) ORDER BY sequence DESC LIMIT 1`,
+          websiteId,
+          key,
+          forced,
+          actor.id,
+        )
+      )[0];
+    const countsNow = () =>
+      tx.$queryRawUnsafe<{ global: number; site: number; actor: number }[]>(
+        `SELECT count(*)::int AS global,count(*) FILTER(WHERE q.website_id=$1::uuid)::int AS site,
+       count(*) FILTER(WHERE (q.target=ANY($3::text[]))=$4::boolean AND EXISTS(SELECT 1 FROM liekan_analysis_query_consumer c WHERE c.job_id=q.id AND c.actor_id=$2::uuid))::int AS actor
+       FROM liekan_analysis_query q WHERE q.status IN('queued','running') AND q.retention_until>clock_timestamp()`,
+        websiteId,
+        actor.id,
+        liveAnalysisTargets,
+        liveAnalysisTargets.includes(target),
+      );
+    const joinedNow = async (job: Row | undefined) =>
+      Boolean(
+        job &&
+          (
+            await tx.$queryRawUnsafe<any[]>(
+              'SELECT 1 FROM liekan_analysis_query_consumer WHERE job_id=$1::uuid AND actor_id=$2::uuid',
+              job.id,
+              actor.id,
+            )
+          ).length,
+      );
+    const quotaBlocked = (
+      counts: { global: number; site: number; actor: number },
+      job: Row | undefined,
+      joined: boolean,
+    ) =>
+      (!job &&
+        (counts.global >= analysisQueryLimits.global || counts.site >= analysisQueryLimits.site)) ||
+      (!joined && counts.actor >= analysisQueryLimits.actor);
+    const concurrencyError = () =>
+      new LiekanError(
+        '后台统计任务已达上限，请等待当前任务完成',
+        429,
+        'analysis-concurrency-limited',
+      );
     const [lock] = await tx.$queryRawUnsafe<{ locked: boolean }[]>(
       'SELECT pg_try_advisory_xact_lock(1277339412) AS locked',
     );
-    if (!lock.locked)
+    if (!lock.locked) {
+      // At the existing retry boundary, report a proved quota limit without allocating work.
+      if (Date.now() >= admissionDeadline) {
+        const active = await activeNow();
+        const [counts] = await countsNow();
+        if (quotaBlocked(counts, active, await joinedNow(active))) throw concurrencyError();
+      }
       throw new LiekanError('统计任务登记繁忙，请稍后重试', 503, 'analysis-admission-busy');
+    }
     // Recheck after the global admission lock: another process may have registered the same input.
-    const [concurrent] = await tx.$queryRawUnsafe<Row[]>(
-      `SELECT * FROM liekan_analysis_query WHERE website_id=$1::uuid AND query_key=$2 AND status IN('queued','running') AND retention_until>clock_timestamp() AND ($3=false OR (forced AND actor_id=$4::uuid AND queued_at>clock_timestamp()-interval '5 seconds')) ORDER BY sequence DESC LIMIT 1`,
-      websiteId,
-      key,
-      forced,
-      actor.id,
-    );
-    existing = concurrent;
+    existing = await activeNow();
     if (
       forced &&
       rows.some(
@@ -223,32 +278,22 @@ async function requestAnalysisQueryOnce(
       BigInt(capacity.siteBytes) >= BigInt(capacity.siteLimit)
     )
       throw new LiekanError('统计结果空间已达上限', 503, 'analysis-capacity-limited');
-    const [counts] = await tx.$queryRawUnsafe<{ global: number; site: number; actor: number }[]>(
-      `SELECT count(*)::int AS global,count(*) FILTER(WHERE q.website_id=$1::uuid)::int AS site,
-       count(*) FILTER(WHERE (q.target=ANY($3::text[]))=$4::boolean AND EXISTS(SELECT 1 FROM liekan_analysis_query_consumer c WHERE c.job_id=q.id AND c.actor_id=$2::uuid))::int AS actor
-       FROM liekan_analysis_query q WHERE q.status IN('queued','running') AND q.retention_until>clock_timestamp()`,
-      websiteId,
-      actor.id,
-      liveAnalysisTargets,
-      liveAnalysisTargets.includes(target),
-    );
-    const joined =
-      existing &&
-      (await tx.$queryRawUnsafe<any[]>(
-        'SELECT 1 FROM liekan_analysis_query_consumer WHERE job_id=$1::uuid AND actor_id=$2::uuid',
-        existing.id,
-        actor.id,
-      ));
+    let [counts] = await countsNow();
+    const joined = await joinedNow(existing);
+    const concurrencyLimited = () => quotaBlocked(counts, existing, joined);
     if (
-      (!existing &&
-        (counts.global >= analysisQueryLimits.global || counts.site >= analysisQueryLimits.site)) ||
-      (!joined?.length && counts.actor >= analysisQueryLimits.actor)
+      foreground &&
+      concurrencyLimited() &&
+      (await yieldIdleDashboard(tx, actor.id, websiteId, {
+        epoch: snapshot.epoch,
+        strong: snapshot.strong,
+        targets: liveAnalysisTargets,
+        actorClass:
+          counts.actor >= analysisQueryLimits.actor ? liveAnalysisTargets.includes(target) : null,
+      }))
     )
-      throw new LiekanError(
-        '后台统计任务已达上限，请等待当前任务完成',
-        429,
-        'analysis-concurrency-limited',
-      );
+      [counts] = await countsNow();
+    if (concurrencyLimited()) throw concurrencyError();
     let job = existing;
     if (!job) {
       [job] = await tx.$queryRawUnsafe<Row[]>(
@@ -289,6 +334,7 @@ export async function requestAnalysisQuery(
   input: Record<string, unknown>,
   locale: 'zh-CN' | 'en-US' = 'zh-CN',
   registered?: AnalysisRegistration,
+  foreground = true,
 ) {
   const key = analysisDigest([
     websiteId,
@@ -297,6 +343,7 @@ export async function requestAnalysisQuery(
     input,
     locale,
     getPublishedCatalog()?.version,
+    foreground,
   ]);
   const pending = registrations.get(key);
   if (pending) await pending.catch(() => {});
@@ -304,14 +351,31 @@ export async function requestAnalysisQuery(
   const run = async () => {
     for (;;) {
       try {
-        return await requestAnalysisQueryOnce(websiteId, actor, target, input, locale, registered);
+        return await requestAnalysisQueryOnce(
+          websiteId,
+          actor,
+          target,
+          input,
+          locale,
+          registered,
+          foreground,
+          deadline,
+        );
       } catch (error) {
-        if (
-          !(error instanceof LiekanError) ||
-          error.code !== 'analysis-admission-busy' ||
-          Date.now() >= deadline
-        )
+        if (!(error instanceof LiekanError) || error.code !== 'analysis-admission-busy')
           throw error;
+        if (Date.now() >= deadline)
+          // One final check covers a deadline crossed while the refusal was returning.
+          return requestAnalysisQueryOnce(
+            websiteId,
+            actor,
+            target,
+            input,
+            locale,
+            registered,
+            foreground,
+            0,
+          );
         await new Promise(resolve => setTimeout(resolve, 25));
       }
     }
@@ -381,6 +445,7 @@ export async function pumpAnalysisQueries(boss: Pick<PgBoss, 'send' | 'update'>)
     await tx.$executeRawUnsafe(`UPDATE liekan_analysis_query SET status=CASE WHEN attempts>=4 THEN 'failed' ELSE 'queued' END,error_code='analysis-lease-expired',lease_token=NULL,lease_until=NULL
      WHERE status='running' AND lease_until<=clock_timestamp()`);
     await pauseIdleDashboardRetries(tx);
+    await preserveDashboardFailure(tx);
     await tx.$executeRawUnsafe(
       `DELETE FROM liekan_analysis_query WHERE retention_until<=clock_timestamp()`,
     );
@@ -631,6 +696,7 @@ export async function processAnalysisQuery(id: string) {
     } catch (error) {
       failure = error || new Error('analysis-compute-failed');
       const status = error instanceof LiekanError ? error.status : 500;
+      // Acquisition and publication failures remain retryable; budget failures carry an explicit code.
       const code = error instanceof LiekanError ? error.code : 'analysis-compute-failed';
       try {
         await analysisTransaction(async tx => {
@@ -644,6 +710,7 @@ export async function processAnalysisQuery(id: string) {
             status,
             code,
           );
+          await preserveDashboardFailure(tx, row.id);
           await pauseIdleDashboardRetries(tx);
         });
       } catch (recoveryError) {

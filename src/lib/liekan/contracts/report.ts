@@ -50,7 +50,12 @@ export interface LiekanReport {
   tables: Record<string, Row[]>;
   insights: string[];
   meta: {
-    snapshot?: { dataThrough: number; state: 'ready' | 'updating'; intervalMs: number };
+    snapshot?: {
+      dataThrough: number;
+      state: 'ready' | 'updating';
+      intervalMs: number;
+      updateError?: boolean;
+    };
     population?: BrowserPopulation;
     trendPopulation?: BrowserPopulation;
     catalogVersion?: string;
@@ -185,6 +190,7 @@ export const liekanReportSchema = z.object({
         dataThrough: z.number(),
         state: z.enum(['ready', 'updating']),
         intervalMs: z.number(),
+        updateError: z.boolean().optional(),
       })
       .optional(),
     population: browserPopulationSchema.optional(),

@@ -9,6 +9,23 @@ import { calendarDayRange } from '../contracts/calendar';
 export const DASHBOARD_INTERVAL = 30000;
 export const DASHBOARD_SETTLE = 0;
 export const DASHBOARD_FORMAT = 'dashboard-snapshot-v4';
+/** These pages derive values from facts; their within-day clock only bounds source reads. */
+export function canAdvanceDashboardClock(
+  target: string,
+  parameters: Record<string, any>,
+  from: number,
+  to: number,
+) {
+  return (
+    target === 'feature:page-report' &&
+    ['overview', 'human/overview'].includes(parameters.resource) &&
+    Number.isFinite(from) &&
+    from > 0 &&
+    to > from &&
+    formatInTimeZone(from, parameters.timezone || 'UTC', 'yyyy-MM-dd') ===
+      formatInTimeZone(to, parameters.timezone || 'UTC', 'yyyy-MM-dd')
+  );
+}
 export const dashboardInterval = (target: string) =>
   [
     'native:heatmaps',
@@ -92,7 +109,7 @@ export function dashboardWindow(
       hot && target !== 'feature:page-report' ? { ...parameters, endAt: effectiveEnd } : parameters,
     // Entry attribution, comparison periods and six-month trends can depend on earlier facts.
     dependencyEnd: hot
-      ? Math.max(effectiveEnd + (halfOpen ? 0 : 1), dedicatedToday ? cutoff : 0)
+      ? Math.max(effectiveEnd + (halfOpen ? 0 : 1), dedicatedToday ? cutoff + 1 : 0)
       : end + (halfOpen ? 0 : 1),
   };
 }

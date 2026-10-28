@@ -1,15 +1,17 @@
 'use client';
-import { useEffect, useRef, useState } from 'react';
 import { fromZonedTime } from 'date-fns-tz';
+import { useEffect, useRef, useState } from 'react';
 import type {
   AnalysisBuildDto,
   AnalysisStatusDto,
   AnalysisWebsiteList,
 } from '@/lib/liekan/contracts/analysis-acceleration';
-import { useLiekanI18n } from '@/lib/liekan/i18n/client';
 import { useManualQuery, useManualRefresh } from '@/lib/liekan/contracts/manual-refresh';
+import { useLiekanI18n } from '@/lib/liekan/i18n/client';
 import { useFeature } from './context';
+import { StorageRetentionPanel } from './StorageRetentionPanel';
 import { Body, Button, Definition, Field, LinkButton, Notice, Panel, Select, Table } from './ui';
+
 const labels = {
   queued: '排队中',
   running: '构建中',
@@ -35,10 +37,12 @@ export function AnalyticsAccelerationPage() {
     [busy, setBusy] = useState(false),
     [pollPaused, setPollPaused] = useState(false),
     [pollRound, setPollRound] = useState(0),
+    [unsupportedRead, setUnsupportedRead] = useState(false),
     [restricted, setRestricted] = useState(false);
   const restrictedAt = useRef(0);
   const failure = (error: any) => {
     setError(error.message);
+    setUnsupportedRead(error.status === 501);
     if ([401, 403, 404, 409, 410].includes(error.status)) {
       restrictedAt.current = Date.now();
       setRestricted(true);
@@ -59,6 +63,11 @@ export function AnalyticsAccelerationPage() {
     enabled: !!siteId,
     queryFn: ({ signal }) => c.api.get(endpoint(siteId), undefined, signal),
   });
+  const readErrors = [detailRead.error, listRead.error] as any[];
+  const unsupported = unsupportedRead || readErrors.some(error => error?.status === 501);
+  const storageRestricted =
+    restricted || readErrors.some(error => [401, 403, 404, 409, 410].includes(error?.status));
+  const storageWebsiteId = unsupported ? undefined : siteId || undefined;
   useEffect(() => {
     setSiteId(c.query.websiteId || '');
   }, [c.query.websiteId]);
@@ -70,25 +79,28 @@ export function AnalyticsAccelerationPage() {
     setError('');
     setMessage('');
     setPollPaused(false);
+    setUnsupportedRead(false);
     setBusy(false);
   }, [scope]);
   useEffect(() => {
     if (
       authorized &&
+      !detailRead.error &&
       detailRead.data?.websiteId === siteId &&
       (!restricted || detailRead.dataUpdatedAt > restrictedAt.current)
     ) {
       setRestricted(false);
+      setUnsupportedRead(false);
       setDetail(detailRead.data);
     }
-  }, [detailRead.data, detailRead.dataUpdatedAt, authorized, siteId, restricted]);
+  }, [detailRead.data, detailRead.dataUpdatedAt, detailRead.error, authorized, siteId, restricted]);
   useEffect(() => {
     const error = detailRead.error || listRead.error;
     if (error) failure(error);
   }, [detailRead.error, listRead.error]);
   const active = !!detail?.builds.some(row => ['queued', 'running'].includes(row.status));
   useEffect(() => {
-    if (!authorized || restricted || !siteId || !active) return;
+    if (!authorized || restricted || unsupported || !siteId || !active) return;
     const controller = new AbortController();
     const expectedScope = scope;
     let timer: ReturnType<typeof setTimeout>;
@@ -115,6 +127,7 @@ export function AnalyticsAccelerationPage() {
         );
         if (controller.signal.aborted || current.current !== expectedScope) return;
         setDetail(value);
+        setUnsupportedRead(false);
         setError('');
         if (value.builds.some(row => ['queued', 'running'].includes(row.status)))
           timer = setTimeout(load, 3000);
@@ -127,9 +140,9 @@ export function AnalyticsAccelerationPage() {
       controller.abort();
       clearTimeout(timer);
     };
-  }, [siteId, scope, pollRound, active, authorized, restricted]);
+  }, [siteId, scope, pollRound, active, authorized, restricted, unsupported]);
   async function act(work: () => Promise<unknown>) {
-    if (!authorized || restricted || busy) return;
+    if (!authorized || restricted || unsupported || busy) return;
     const expectedScope = scope;
     setBusy(true);
     setError('');
@@ -141,6 +154,7 @@ export function AnalyticsAccelerationPage() {
       if (current.current !== expectedScope) return;
       if (value.error) throw value.error;
       setDetail(value.data);
+      setUnsupportedRead(false);
       setMessage(i18n.text('操作已提交，关闭页面后后台继续处理。'));
       setPollPaused(false);
       setPollRound(value => value + 1);
@@ -190,7 +204,13 @@ export function AnalyticsAccelerationPage() {
         </Body>
       </Panel>
       {siteId && !detail && !error && <Notice>{i18n.text('正在读取加速状态')}</Notice>}
-      {authorized && !restricted && detail?.websiteId === siteId && (
+      {authorized &&
+        !storageRestricted &&
+        ((!unsupported && detail?.websiteId === siteId && !!siteId) ||
+          (c.user.role === 'admin' && (!siteId || unsupported))) && (
+          <StorageRetentionPanel key={siteId || 'instance'} websiteId={storageWebsiteId} />
+        )}
+      {authorized && !restricted && !unsupported && detail?.websiteId === siteId && (
         <>
           {detail.expansion && (!detail.expansion.path || !detail.expansion.visit) && (
             <Notice>{i18n.text('高基数扩展已暂停，未覆盖范围继续使用原始事实。')}</Notice>

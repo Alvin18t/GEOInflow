@@ -38,10 +38,10 @@ function pieces(source: string) {
   const point = `jsonb_build_object('at',created_at,'id',event_id,'path',url_path,'type',event_type,'name',event_name,'country',country,'region',region,'city',city)`;
   return `detail_events AS MATERIALIZED (SELECT *,${floor('created_at')} AS bucket FROM ${source} WHERE event_type<>5),
  detail_pairs AS (SELECT DISTINCT session_id,visit_id FROM detail_events),
- detail_entries AS MATERIALIZED (SELECT p.session_id,p.visit_id,anchor.entry FROM detail_pairs p
-  LEFT JOIN LATERAL(SELECT jsonb_build_object('referrer',e.referrer_domain,'utmSource',e.utm_source,'utmMedium',e.utm_medium,'utmCampaign',e.utm_campaign) AS entry
-   FROM bounded_entry e WHERE e.website_id=$1::uuid AND e.session_id=p.session_id AND e.visit_id=p.visit_id
-   AND e.event_type NOT IN(2,5) ORDER BY e.created_at,e.event_id LIMIT 1) anchor ON true),
+ detail_entries AS MATERIALIZED (SELECT p.session_id,p.visit_id,
+  CASE WHEN e.event_id IS NOT NULL THEN jsonb_build_object('referrer',e.referrer_domain,'utmSource',e.utm_source,'utmMedium',e.utm_medium,'utmCampaign',e.utm_campaign) END AS entry
+  FROM detail_pairs p LEFT JOIN bounded_entry e ON e.website_id=$1::uuid
+   AND e.session_id=p.session_id AND e.visit_id=p.visit_id AND e.event_type NOT IN(2,5)),
  detail_visits AS MATERIALIZED (SELECT ${key},count(*) FILTER(WHERE ${pv}) AS pageviews,bool_or(event_type=2) AS has_custom,
   (array_agg(${point} ORDER BY created_at,event_id) FILTER(WHERE ${pv}))[1] AS first_pv,
   (array_agg(${point} ORDER BY created_at DESC,event_id DESC) FILTER(WHERE ${pv}))[1] AS last_pv,

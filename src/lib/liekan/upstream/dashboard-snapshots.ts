@@ -13,17 +13,20 @@ import {
   dashboardWarmRanges,
   DASHBOARD_FORMAT,
   dashboardInterval,
+  canAdvanceDashboardClock,
 } from './dashboard-snapshot-model';
 import type { CrawlerActor } from './crawler-access';
 import { noteBrowserPopulation } from './cache-context';
 import { pageReportParts } from '../contracts/page-report';
 import { withPublishedRegistry } from './crawler-registry-context';
 import { LiekanError } from './errors';
+import { hasAnalysisBuildCapacity } from './storage-capacity';
 import {
   analysisForegroundDemandSql,
   coldDashboardPrewarmSql,
   foregroundAnalysisQueuedSql,
   pauseIdleDashboardRetries,
+  dashboardCapacityLockNamespace,
 } from './dashboard-demand';
 
 type MaintenancePass = { coldRegistered: boolean };
@@ -37,7 +40,7 @@ export function dashboardRefreshJobId(value: object): string | undefined {
 async function lockSnapshotCapacity(tx: AnalysisTx, websiteId: string) {
   // Capacity writers serialize independently of the shared authority held by bounded builds.
   await tx.$queryRawUnsafe(
-    'SELECT 1 FROM pg_advisory_xact_lock(1277339413,hashtext($1::text))',
+    `SELECT 1 FROM pg_advisory_xact_lock(${dashboardCapacityLockNamespace},hashtext($1::text))`,
     websiteId,
   );
   // Preserve the mode/epoch fence while allowing other authority readers to keep working.
@@ -81,6 +84,7 @@ type Snapshot = {
   next_refresh_at: Date;
   last_read_at: Date;
   error_code: string | null;
+  attempt_fingerprint?: string | null;
   recent?: boolean;
 };
 
@@ -92,6 +96,114 @@ async function fingerprint(tx: AnalysisTx, row: Pick<Snapshot, 'website_id' | 'e
     end,
   );
   return value.fingerprint;
+}
+
+/** Recovery progress can unblock a timeout without invalidating a correct published result. */
+async function attemptFingerprint(
+  tx: AnalysisTx,
+  row: Pick<Snapshot, 'website_id' | 'epoch'>,
+  end: Date,
+) {
+  const [coverage] = await tx.$queryRawUnsafe<{ latest: string | null; count: string }[]>(
+    `SELECT max(created_at)::text AS latest,count(*)::text AS count FROM liekan_analysis_manifest
+     WHERE website_id=$1::uuid AND epoch=$2::bigint AND bucket<$3::timestamptz`,
+    row.website_id,
+    String(row.epoch),
+    end,
+  );
+  return analysisDigest([
+    await fingerprint(tx, row, end),
+    coverage,
+    hasAnalysisBuildCapacity(await analysisCapacity(tx, row.website_id)),
+  ]);
+}
+
+async function advanceUnchangedSnapshot(
+  row: Snapshot,
+  actor: CrawlerActor,
+  window: ReturnType<typeof dashboardWindow>,
+) {
+  if (
+    row.job_id ||
+    row.error_code ||
+    !canAdvanceDashboardClock(
+      row.target,
+      row.parameters,
+      +new Date(row.data_through || 0),
+      window.through,
+    )
+  )
+    return;
+  return analysisTransaction(async tx => {
+    const current = await analysisQueryState(tx, row.website_id, actor);
+    const [saved] = await tx.$queryRawUnsafe<Snapshot[]>(
+      'SELECT * FROM liekan_dashboard_snapshot WHERE website_id=$1::uuid AND query_key=$2 FOR UPDATE',
+      row.website_id,
+      row.query_key,
+    );
+    if (!saved?.result || saved.job_id || saved.error_code || !saved.fingerprint) return;
+    if (current.strong !== saved.strong_version || String(current.epoch) !== String(saved.epoch))
+      return;
+    if (
+      !canAdvanceDashboardClock(
+        saved.target,
+        saved.parameters,
+        +new Date(saved.data_through || 0),
+        window.through,
+      )
+    )
+      return;
+    const end = new Date(window.dependencyEnd);
+    if ((await fingerprint(tx, saved, end)) !== saved.fingerprint) return;
+    const envelope = decodeAnalysisEnvelope(saved.result, saved.website_id);
+    const value: any = envelope.value;
+    const previousEnd = Math.min(Number(saved.parameters.endAt), +new Date(saved.data_through) - 1);
+    const nextEnd = Math.min(Number(saved.parameters.endAt), window.through - 1);
+    if (value?.range?.endAt !== previousEnd) return;
+    value.range.endAt = nextEnd;
+    if (value.meta?.snapshot) value.meta.snapshot.dataThrough = window.through;
+    for (const population of [
+      value.meta?.population,
+      value.meta?.trendPopulation,
+      ...envelope.populations,
+    ])
+      if (
+        population?.range?.endAt === previousEnd &&
+        population.range.timezone === saved.parameters.timezone
+      )
+        population.range.endAt = nextEnd;
+    const bytes = Buffer.byteLength(JSON.stringify(envelope));
+    if (bytes > 2 * 1024 * 1024) return;
+    if (bytes > saved.result_bytes) {
+      const capacity = await analysisCapacity(tx, saved.website_id);
+      const growth = BigInt((bytes - saved.result_bytes) * 2);
+      if (
+        BigInt(capacity.siteBytes) + growth >= BigInt(capacity.siteLimit) ||
+        BigInt(capacity.globalBytes) + growth >= BigInt(capacity.globalLimit)
+      )
+        return;
+    }
+    await tx.$executeRawUnsafe(
+      `UPDATE liekan_dashboard_snapshot SET data_through=$3,dependency_end=$4,next_refresh_at=$5,checked_at=clock_timestamp(),
+       result=$6::jsonb,result_bytes=$7
+       WHERE website_id=$1::uuid AND query_key=$2`,
+      saved.website_id,
+      saved.query_key,
+      new Date(window.through),
+      end,
+      new Date(window.nextRefresh),
+      JSON.stringify(envelope),
+      bytes,
+    );
+    return {
+      ...saved,
+      result: envelope,
+      result_bytes: bytes,
+      data_through: new Date(window.through),
+      dependency_end: end,
+      next_refresh_at: new Date(window.nextRefresh),
+    };
+  });
 }
 
 function snapshotKey(
@@ -165,6 +277,9 @@ function project(row: Snapshot, website: any, stale: boolean) {
         dataThrough: +new Date(row.data_through),
         state: stale ? 'updating' : 'ready',
         intervalMs: interval,
+        ...(['dashboard-compute-failed', 'dashboard-refresh-failed'].includes(row.error_code)
+          ? { updateError: true }
+          : {}),
       },
     };
   }
@@ -195,7 +310,7 @@ export async function requestDashboardSnapshot(
   let window = dashboardWindow(target, parameters, readAt, foreground);
   const state = await analysisTransaction(tx => analysisQueryState(tx, websiteId, actor));
   if (state.mode === 'disabled')
-    return requestAnalysisQuery(websiteId, actor, target, input, locale);
+    return requestAnalysisQuery(websiteId, actor, target, input, locale, undefined, foreground);
   if (!process.env.CLICKHOUSE_URL && state.mode === 'live') {
     const canonical = canonicalDashboardParameters(target, parameters, readAt);
     if (canonical !== parameters) {
@@ -278,10 +393,19 @@ export async function requestDashboardSnapshot(
         changed = false;
       }
     }
+    if (foreground && input.refresh !== '1')
+      row = (await advanceUnchangedSnapshot(row, actor, window)) || row;
     const due = window.hot && +new Date(row.data_through) < window.through;
     if (foreground && (input.refresh === '1' || due || changed)) {
       try {
-        const job = await enqueue(row, actor, maintenance);
+        const job = await enqueue(
+          row,
+          actor,
+          maintenance,
+          input.refresh === '1',
+          false,
+          foreground,
+        );
         if (
           !job.ready &&
           (input.refresh === '1' ||
@@ -295,6 +419,15 @@ export async function requestDashboardSnapshot(
           value: job.analysisJob.id,
         });
       } catch (error) {
+        if (
+          ['analysis-compute-blocked', 'analysis-retry-deferred'].includes((error as any)?.code)
+        ) {
+          row.error_code =
+            (error as any)?.code === 'analysis-compute-blocked'
+              ? 'dashboard-compute-failed'
+              : 'dashboard-refresh-failed';
+          return project(row, current.website, true);
+        }
         // A full queue retains the published value; the next visible read retries admission.
         if (
           (error as any)?.status !== 429 &&
@@ -309,7 +442,7 @@ export async function requestDashboardSnapshot(
       changed || due || (+new Date(row.next_refresh_at) <= Date.now() && window.hot),
     );
   }
-  const job = await enqueue(row, actor, maintenance);
+  const job = await enqueue(row, actor, maintenance, input.refresh === '1', false, foreground);
   if (job.ready) return job;
   return {
     ...job,
@@ -317,15 +450,110 @@ export async function requestDashboardSnapshot(
   };
 }
 
-async function enqueue(row: Snapshot, actor: CrawlerActor, maintenance?: MaintenancePass) {
-  if (row.job_id) {
-    const [active] = await analysisTransaction(tx =>
-      tx.$queryRawUnsafe<{ parameters: Record<string, unknown> }[]>(
-        "SELECT parameters FROM liekan_analysis_query WHERE id=$1::uuid AND status IN('queued','running')",
-        row.job_id,
+async function enqueue(
+  row: Snapshot,
+  actor: CrawlerActor,
+  maintenance?: MaintenancePass,
+  retry = false,
+  rechecked = false,
+  foreground = true,
+) {
+  const window = dashboardWindow(
+    row.target,
+    row.parameters,
+    Date.now(),
+    +new Date(row.last_read_at) > Date.now() - 120000,
+    +new Date(row.data_through || 0),
+  );
+  const end = new Date(window.dependencyEnd);
+  const rejoin = async () => {
+    if (rechecked)
+      throw new LiekanError('统计任务状态已更新，请重新读取', 409, 'analysis-state-changed');
+    const [current] = await analysisTransaction(tx =>
+      tx.$queryRawUnsafe<Snapshot[]>(
+        'SELECT * FROM liekan_dashboard_snapshot WHERE website_id=$1::uuid AND query_key=$2',
+        row.website_id,
+        row.query_key,
       ),
     );
-    if (active) {
+    if (!current) throw new LiekanError('统计任务已变化，请重新读取', 410, 'analysis-invalidated');
+    const state = await analysisTransaction(tx => analysisQueryState(tx, row.website_id, actor));
+    if (state.strong !== current.strong_version || String(state.epoch) !== String(current.epoch))
+      throw new LiekanError('统计条件已变化，请重新读取', 410, 'analysis-invalidated');
+    if (current.result != null && !current.job_id) return project(current, state.website, true);
+    return enqueue(current, actor, maintenance, retry, true, foreground);
+  };
+  const [active] = row.job_id
+    ? await analysisTransaction(tx =>
+        tx.$queryRawUnsafe<
+          {
+            parameters: Record<string, unknown>;
+            status: string;
+            error_code: string;
+            updated_at: Date;
+          }[]
+        >(
+          'SELECT parameters,status,error_code,updated_at FROM liekan_analysis_query WHERE id=$1::uuid',
+          row.job_id,
+        ),
+      )
+    : [];
+  if (!retry) {
+    const deterministic =
+      row.error_code === 'dashboard-compute-failed' ||
+      (active?.status === 'failed' &&
+        ['analysis-query-timeout', 'analysis-count-overflow'].includes(active.error_code));
+    if (deterministic) {
+      const input = await analysisTransaction(tx => attemptFingerprint(tx, row, end));
+      if (!row.attempt_fingerprint || row.attempt_fingerprint === input) {
+        const marked = await analysisTransaction(tx =>
+          tx.$executeRawUnsafe(
+            `UPDATE liekan_dashboard_snapshot SET error_code='dashboard-compute-failed',
+           attempt_fingerprint=coalesce(attempt_fingerprint,$3),next_refresh_at=$4
+           WHERE website_id=$1::uuid AND query_key=$2 AND job_id IS NOT DISTINCT FROM $5::uuid`,
+            row.website_id,
+            row.query_key,
+            input,
+            new Date(window.nextRefresh),
+            row.job_id,
+          ),
+        );
+        if (!marked) return rejoin();
+        throw new LiekanError(
+          '统计计算未完成，可主动重试；后台将在数据或加速覆盖变化后恢复',
+          503,
+          'analysis-compute-blocked',
+        );
+      }
+    } else {
+      const retryAt =
+        active?.status === 'failed' && active.error_code !== 'analysis-idle'
+          ? +new Date(active.updated_at) + 300000
+          : row.error_code === 'dashboard-refresh-failed'
+            ? +new Date(row.next_refresh_at)
+            : 0;
+      if (retryAt > Date.now()) {
+        const marked = await analysisTransaction(tx =>
+          tx.$executeRawUnsafe(
+            `UPDATE liekan_dashboard_snapshot SET error_code='dashboard-refresh-failed',next_refresh_at=$3
+           WHERE website_id=$1::uuid AND query_key=$2 AND job_id IS NOT DISTINCT FROM $4::uuid`,
+            row.website_id,
+            row.query_key,
+            new Date(retryAt),
+            row.job_id,
+          ),
+        );
+        if (!marked) return rejoin();
+        throw new LiekanError(
+          '统计暂时不可用，后台稍后重试，也可主动重试',
+          503,
+          'analysis-retry-deferred',
+        );
+      }
+    }
+  }
+  if (row.job_id) {
+    if (active && ['queued', 'running'].includes(active.status)) {
       if (row.target === 'feature:page-report' && +new Date(row.last_read_at) > Date.now() - 120000)
         await analysisTransaction(async tx => {
           const [deferred] = await tx.$queryRawUnsafe<any[]>(
@@ -370,18 +598,19 @@ async function enqueue(row: Snapshot, actor: CrawlerActor, maintenance?: Mainten
             new Date(visible.nextRefresh),
           );
         });
-      return requestAnalysisQuery(row.website_id, actor, row.target, active.parameters, row.locale);
+      return requestAnalysisQuery(
+        row.website_id,
+        actor,
+        row.target,
+        active.parameters,
+        row.locale,
+        undefined,
+        foreground,
+      );
     }
   }
-  const window = dashboardWindow(
-    row.target,
-    row.parameters,
-    Date.now(),
-    +new Date(row.last_read_at) > Date.now() - 120000,
-    +new Date(row.data_through || 0),
-  );
-  const end = new Date(window.dependencyEnd);
   const pin = await analysisTransaction(tx => fingerprint(tx, row, end));
+  const attempt = await analysisTransaction(tx => attemptFingerprint(tx, row, end));
   const cold =
     row.target === 'feature:page-report' &&
     row.result == null &&
@@ -478,7 +707,7 @@ async function enqueue(row: Snapshot, actor: CrawlerActor, maintenance?: Mainten
       // An active producer keeps its originally pinned boundary and publication fence.
       await tx.$executeRawUnsafe(
         `UPDATE liekan_dashboard_snapshot SET job_id=$3::uuid,pending_fingerprint=$4,pending_through=$5,
-       dependency_end=$6,next_refresh_at=$7,error_code=NULL
+       dependency_end=$6,next_refresh_at=$7,error_code=NULL,attempt_fingerprint=$8
        WHERE website_id=$1::uuid AND query_key=$2 AND (job_id IS NULL
         OR NOT EXISTS(SELECT 1 FROM liekan_analysis_query q WHERE q.id=job_id AND q.status IN('queued','running')))`,
         row.website_id,
@@ -488,6 +717,7 @@ async function enqueue(row: Snapshot, actor: CrawlerActor, maintenance?: Mainten
         new Date(window.through),
         end,
         new Date(window.nextRefresh),
+        attempt,
       );
       if (!window.computable)
         await tx.$executeRawUnsafe(
@@ -499,8 +729,10 @@ async function enqueue(row: Snapshot, actor: CrawlerActor, maintenance?: Mainten
       if (job.status === 'ready' && job.generated_at)
         await publishDashboardSnapshot(tx, { ...job, generated_at: job.generated_at });
     },
+    foreground,
   );
   if (cold && !result.ready && maintenance) maintenance.coldRegistered = true;
+  row.error_code = null;
   return result;
 }
 
@@ -515,6 +747,13 @@ export async function dashboardJobClock(tx: AnalysisTx, jobId: string) {
       row.website_id,
       row.query_key,
       await fingerprint(tx, row, row.dependency_end),
+    );
+  for (const row of rows)
+    await tx.$executeRawUnsafe(
+      'UPDATE liekan_dashboard_snapshot SET attempt_fingerprint=$3 WHERE website_id=$1::uuid AND query_key=$2',
+      row.website_id,
+      row.query_key,
+      await attemptFingerprint(tx, row, row.dependency_end),
     );
   return rows.length ? +new Date(rows[0].pending_through) : undefined;
 }
@@ -597,8 +836,11 @@ export async function pumpDashboardSnapshots(
           // Returning readers recheck parked publications through the existing input fences.
           await analysisTransaction(tx =>
             tx.$executeRawUnsafe(
-              `UPDATE liekan_dashboard_snapshot SET next_refresh_at='9999-12-31'::timestamptz,
-               error_code='dashboard-idle',job_id=NULL,pending_fingerprint=NULL
+              `UPDATE liekan_dashboard_snapshot d SET next_refresh_at='9999-12-31'::timestamptz,
+               error_code=CASE WHEN d.error_code='dashboard-compute-failed' OR EXISTS(
+                 SELECT 1 FROM liekan_analysis_query q WHERE q.id=d.job_id AND q.status='failed'
+                  AND q.error_code IN('analysis-query-timeout','analysis-count-overflow'))
+                 THEN 'dashboard-compute-failed' ELSE 'dashboard-idle' END,job_id=NULL,pending_fingerprint=NULL
                WHERE website_id=$1::uuid AND query_key=$2
                AND last_read_at<=clock_timestamp()-interval '2 minutes'
                AND NOT EXISTS(SELECT 1 FROM liekan_analysis_query q
@@ -658,6 +900,7 @@ export async function pumpDashboardSnapshots(
           );
           return;
         }
+        if (await advanceUnchangedSnapshot(row, actor, window)) return;
         const pin = await analysisTransaction(tx =>
           fingerprint(tx, row, new Date(window.dependencyEnd)),
         );
@@ -679,9 +922,11 @@ export async function pumpDashboardSnapshots(
           );
           return;
         }
-        if (window.computable) await enqueue(row, actor, maintenance);
+        if (window.computable) await enqueue(row, actor, maintenance, false, false, recent);
       });
     } catch (error) {
+      if (['analysis-compute-blocked', 'analysis-retry-deferred'].includes((error as any)?.code))
+        continue;
       if ((error as any)?.code === 'dashboard-cold-busy') continue;
       const status = (error as any)?.status;
       await analysisTransaction(tx =>

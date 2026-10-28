@@ -7,7 +7,7 @@ import { type LiekanPageReport, pageReportParts, pageReportSchema } from '../con
 import { parseReportQuery } from '../contracts/query';
 import { buildReport } from '../report';
 import { readKeywordPage } from './keywords';
-import { withoutQueryCache } from './cache-context';
+import { withoutQueryCache, noteBrowserPopulation } from './cache-context';
 import { LiekanError } from './errors';
 import {
   analyticsCache,
@@ -122,9 +122,14 @@ async function readPageReportSnapshot(
   return result;
 }
 
-export const readPageReport: typeof readPageReportSnapshot = (...args) => {
-  if (process.env.CLICKHOUSE_URL) return readPageReportSnapshot(...args);
-  return withPublishedRegistry(() => readPageReportSnapshot(...args));
+export const readPageReport: typeof readPageReportSnapshot = async (...args) => {
+  const result = process.env.CLICKHOUSE_URL
+    ? await readPageReportSnapshot(...args)
+    : await withPublishedRegistry(() => readPageReportSnapshot(...args));
+  // The inner cache bypass owns its context; publish validated evidence to the caller's envelope.
+  for (const population of [result.value.meta.population, result.value.meta.trendPopulation])
+    if (population) noteBrowserPopulation(args[0].id, population);
+  return result;
 };
 
 /** A private async request checks the identical cache identity without starting SQL. */
