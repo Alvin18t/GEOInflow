@@ -24,7 +24,7 @@ import {
   requestDashboardSnapshot,
   seedDashboardSnapshots,
 } from './dashboard-snapshots';
-import { dashboardWarmRanges } from './dashboard-snapshot-model';
+import { DASHBOARD_INTERVAL, dashboardWarmRanges } from './dashboard-snapshot-model';
 import { currentCacheContext } from './cache-context';
 import { timedAnalyticsClient } from './analytics-deadline';
 import { coldDashboardPrewarmSql } from './dashboard-demand';
@@ -789,6 +789,83 @@ describe.skipIf(!enabled)('ordinary dashboard demand scheduling in owned Postgre
       expect(await boss.findJobs(ANALYSIS_QUERY_QUEUE, { key: task.analysisJob.id })).toHaveLength(
         0,
       );
+    });
+  });
+  it.each([
+    { name: 'recent publication', aged: false, alias: null, coldFirst: true },
+    {
+      name: 'publication waiting a full refresh interval',
+      aged: true,
+      alias: null,
+      coldFirst: false,
+    },
+    { name: 'recent missing-result alias', aged: false, alias: 'recent', coldFirst: false },
+    { name: 'idle missing-result alias', aged: false, alias: 'idle', coldFirst: true },
+  ])('bounds first-result priority against $name', async ({ aged, alias, coldFirst }) => {
+    const initial = await read();
+    if (initial.ready === true) throw new Error('expected publication producer');
+    await finish(initial.analysisJob.id);
+    const [publication] = await q(
+      'SELECT query_key,result FROM liekan_dashboard_snapshot WHERE website_id=$1::uuid',
+      site,
+    );
+    await sql(
+      "UPDATE liekan_analysis_query SET queued_at=clock_timestamp()-interval '10 seconds' WHERE id=$1::uuid",
+      initial.analysisJob.id,
+    );
+    await sql(
+      'UPDATE liekan_dashboard_snapshot SET fingerprint=NULL,data_through=to_timestamp(0) WHERE website_id=$1::uuid',
+      site,
+    );
+    expect((await read()).ready).toBe(true);
+    const [refresh] = await q(
+      'SELECT job_id AS id FROM liekan_dashboard_snapshot WHERE website_id=$1::uuid',
+      site,
+    );
+    expect(refresh.id).not.toBe(initial.analysisJob.id);
+    if (aged)
+      await sql(
+        "UPDATE liekan_analysis_query SET queued_at=clock_timestamp()-$2::int*interval '1 millisecond' WHERE id=$1::uuid",
+        refresh.id,
+        DASHBOARD_INTERVAL + 1000,
+      );
+    if (alias)
+      await sql(
+        `INSERT INTO liekan_dashboard_snapshot(website_id,query_key,actor_id,target,parameters,locale,strong_version,epoch,calendar_day,dependency_end,job_id,last_read_at)
+         SELECT website_id,query_key||':missing-alias',actor_id,target,parameters,'en-US',strong_version,epoch,calendar_day,dependency_end,job_id,
+           CASE WHEN $2::boolean THEN clock_timestamp() ELSE to_timestamp(0) END
+         FROM liekan_dashboard_snapshot WHERE website_id=$1::uuid`,
+        site,
+        alias === 'recent',
+      );
+    const cold = await read(true, site, 'human/overview');
+    if (cold.ready === true) throw new Error('expected first-result producer');
+    const first = coldFirst ? cold.analysisJob.id : refresh.id;
+    const second = coldFirst ? refresh.id : cold.analysisJob.id;
+    await withDeliveryQueue(first, async boss => {
+      try {
+        await pumpAnalysisQueries(boss);
+        expect(
+          await boss.findJobs(ANALYSIS_QUERY_QUEUE, { key: first, queued: true }),
+        ).toHaveLength(1);
+        expect(await boss.findJobs(ANALYSIS_QUERY_QUEUE, { key: second })).toHaveLength(0);
+        expect((await processAnalysisQuery(second)).acquired).toBe(false);
+        expect(
+          (
+            await q(
+              'SELECT result FROM liekan_dashboard_snapshot WHERE website_id=$1::uuid AND query_key=$2',
+              site,
+              publication.query_key,
+            )
+          )[0].result,
+        ).toEqual(publication.result);
+        await finish(first);
+        await finish(second);
+      } finally {
+        for (const id of [first, second])
+          for (const job of await boss.findJobs(ANALYSIS_QUERY_QUEUE, { key: id }))
+            await boss.deleteJob(ANALYSIS_QUERY_QUEUE, job.id);
+      }
     });
   });
   it('TTL lets a valid same-site head advance past an expired earlier head', async () => {

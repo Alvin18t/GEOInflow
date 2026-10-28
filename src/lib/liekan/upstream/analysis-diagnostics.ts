@@ -37,6 +37,7 @@ export function analysisErrorReason(error: unknown) {
   if (code === 'analysis-capacity-limited') return 'capacity';
   if (
     code === 'P2028' ||
+    code === 'analysis-query-timeout' ||
     [
       code,
       detail?.cause?.code,

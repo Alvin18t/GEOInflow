@@ -34,6 +34,7 @@ import {
 import { analyticsRedis } from '../lib/liekan/upstream/analytics-redis';
 import prisma from '../lib/prisma';
 import { processAnalyticsRefresh, readAnalyticsHotStrongVersion } from './analytics-refresh';
+import { pumpStorageRetention } from '../lib/liekan/upstream/storage-retention';
 
 const boss = new PgBoss({
   connectionString: process.env.DATABASE_URL,
@@ -63,6 +64,16 @@ async function pump() {
   }
 }
 await boss.start();
+let storageScheduledAt = Date.now();
+const storageMaintenance = setInterval(() => {
+  const schedule = Date.now() - storageScheduledAt >= 60000;
+  if (schedule) storageScheduledAt = Date.now();
+  if (!stopped)
+    void pumpStorageRetention(boss, { schedule, manualOnly: !schedule }).catch(() =>
+      console.info('storage_cleanup_deferred'),
+    );
+}, 5000);
+void pumpStorageRetention(boss).catch(() => console.info('storage_cleanup_deferred'));
 await boss.work<GeoSnapshotJob>(
   GEO_SNAPSHOT_QUEUE,
   { localConcurrency: 1, batchSize: 1, pollingIntervalSeconds: 1 },
@@ -117,6 +128,7 @@ for (const signal of ['SIGINT', 'SIGTERM'])
     clearInterval(maintenance);
     clearInterval(geoMaintenance);
     clearInterval(heartbeat);
+    clearInterval(storageMaintenance);
     await boss.stop({ graceful: true });
     analyticsRedis.close();
     await prisma.client.$disconnect();

@@ -6,6 +6,11 @@ import { CRAWLER_POPULATION_VERSION } from '../rules/population';
 import { randomUUID } from 'node:crypto';
 import { lockWritableWebsite } from './server';
 import {
+  hasAnalysisBuildCapacity,
+  storageHistoryAllowed,
+  storageHistorySiteAllowedSql,
+} from './storage-capacity';
+import {
   analysisTransaction,
   analysisVersions,
   analysisCapacity,
@@ -13,13 +18,12 @@ import {
   analysisVisitRowsSql,
   ensureAnalysisPartitions,
   chargeAnalysisGeneration,
+  assertAnalysisGenerationWritable,
 } from './analysis-rollups-db';
 import {
   analysisHash,
   ANALYSIS_ROLLUP_VERSION,
   ANALYSIS_CHUNK_SIZE,
-  ANALYSIS_SITE_LIMIT,
-  ANALYSIS_GLOBAL_LIMIT,
   analysisNextBoundary,
   analysisCompletedUnits,
   analysisBuildPrioritySql,
@@ -232,6 +236,7 @@ async function queueRecovery(
   originBuildId: string | null = null,
   excludingBuildId: string | null = null,
   requestedUnit?: 300 | 3600,
+  recoverCapacity = false,
 ) {
   if (+until <= +from) return 0;
   const unit = requestedUnit ?? (family === 'log' ? 300 : 3600);
@@ -266,7 +271,15 @@ async function queueRecovery(
   SELECT $1::uuid,$2::uuid,$3::uuid,$4::bigint,$5,$6,$7,$8,'UTC','zh-CN',$9::uuid,$10,'queued',$11::bigint,$12::uuid
   WHERE NOT EXISTS(SELECT 1 FROM liekan_analysis_build b WHERE b.website_id=$2::uuid AND b.epoch=$4::bigint AND (b.family='both' OR b.family=$5)
    AND b.actor_id IS NULL AND NOT b.automatic_history AND b.unit_seconds=$6 AND b.status IN('queued','running','paused') AND b.range_start<$8::timestamptz AND b.range_end>$7::timestamptz AND b.id IS DISTINCT FROM $13::uuid)
-  ON CONFLICT(website_id,request_id) DO NOTHING`,
+  ON CONFLICT(website_id,request_id) DO UPDATE SET status='queued',attempts=0,error_code=NULL,
+   lease_token=NULL,lease_until=NULL,next_attempt_at=clock_timestamp(),revision=liekan_analysis_build.revision+1,updated_at=clock_timestamp()
+  WHERE $14::boolean AND liekan_analysis_build.status='capacity_limited'
+   AND liekan_analysis_build.error_code='analysis-capacity-limited'
+   AND liekan_analysis_build.actor_id IS NULL AND NOT liekan_analysis_build.automatic_history
+   AND liekan_analysis_build.next_attempt_at<=clock_timestamp()
+   AND EXISTS(SELECT 1 FROM liekan_analysis_site s WHERE s.website_id=EXCLUDED.website_id
+    AND s.epoch=EXCLUDED.epoch AND s.mode='live' AND ${storageHistorySiteAllowedSql}
+    AND (EXCLUDED.family<>'visit' OR s.visit_expansion))`,
     randomUUID(),
     site,
     actorId,
@@ -280,6 +293,7 @@ async function queueRecovery(
     Math.ceil((+until - +from) / (unit * 1000)),
     originBuildId,
     excludingBuildId,
+    recoverCapacity,
   );
 }
 
@@ -350,11 +364,7 @@ export async function runOneAnalysisWorkUnit(
       }
       if (!state.generation) {
         const capacity = await analysisCapacity(tx, row.website_id);
-        if (
-          BigInt(capacity.siteBytes) >= BigInt(ANALYSIS_SITE_LIMIT) ||
-          BigInt(capacity.globalBytes) >= BigInt(ANALYSIS_GLOBAL_LIMIT)
-        )
-          throw new Error('analysis-capacity-limited');
+        if (!hasAnalysisBuildCapacity(capacity)) throw new Error('analysis-capacity-limited');
         state.pathComplete = expansion.path_expansion && wholeHour;
         state.generation = randomUUID();
         state.chunkSize = Math.max(100, Math.floor(ANALYSIS_CHUNK_SIZE / 2 ** row.attempts));
@@ -366,7 +376,7 @@ export async function runOneAnalysisWorkUnit(
         JSON.stringify(state.versions) !==
           JSON.stringify(await analysisVersions(tx, row.website_id))
       ) {
-        // Discard candidate state; its rows stay unreachable and are reclaimed after seven idle days.
+        // Discard candidate state; its unreachable rows remain eligible for the storage policy.
         await updateCheckpoint(tx, row, clearCandidate(state));
         return;
       }
@@ -384,11 +394,7 @@ export async function runOneAnalysisWorkUnit(
       }
       await chargeAnalysisGeneration(tx, row.website_id, state.generation, chunk.bytes);
       const chunkCapacity = await analysisCapacity(tx, row.website_id);
-      if (
-        BigInt(chunkCapacity.siteBytes) >= BigInt(ANALYSIS_SITE_LIMIT) ||
-        BigInt(chunkCapacity.globalBytes) >= BigInt(ANALYSIS_GLOBAL_LIMIT)
-      )
-        throw new Error('analysis-capacity-limited');
+      if (!hasAnalysisBuildCapacity(chunkCapacity)) throw new Error('analysis-capacity-limited');
       state.rows = String(BigInt(state.rows || '0') + BigInt(chunk.rows));
       if (chunk.after_time) {
         state.afterTime = chunk.after_time;
@@ -425,6 +431,7 @@ export async function runOneAnalysisWorkUnit(
       }
       const state = fresh.checkpoint;
       if (state.afterId !== '__publish__') return;
+      await assertAnalysisGenerationWritable(tx, fresh.website_id, state.generation);
       if (
         state.fingerprint !== (await fingerprint(tx, fresh, state)) ||
         JSON.stringify(state.versions) !==
@@ -453,11 +460,7 @@ export async function runOneAnalysisWorkUnit(
         state.fingerprint = await fingerprint(tx, fresh, state);
       }
       const capacity = await analysisCapacity(tx, fresh.website_id);
-      if (
-        BigInt(capacity.siteBytes) >= BigInt(ANALYSIS_SITE_LIMIT) ||
-        BigInt(capacity.globalBytes) >= BigInt(ANALYSIS_GLOBAL_LIMIT)
-      )
-        throw new Error('analysis-capacity-limited');
+      if (!hasAnalysisBuildCapacity(capacity)) throw new Error('analysis-capacity-limited');
       // Remove overlapping empty-span manifests before installing the mutually exclusive replacement.
       // Preserve published generations via the previous_generation pointer for ordinary replacement.
       const overlaps = await tx.$queryRawUnsafe<
@@ -721,52 +724,24 @@ export async function reconcileAnalysisRollups(): Promise<{ queued: number }> {
     await tx.$executeRawUnsafe(`INSERT INTO liekan_analysis_site(website_id) SELECT w.website_id FROM website w
       WHERE w.deleted_at IS NULL AND NOT EXISTS(SELECT 1 FROM liekan_analysis_site s WHERE s.website_id=w.website_id) ORDER BY w.website_id LIMIT 100 ON CONFLICT DO NOTHING`);
     await tx.$executeRawUnsafe(`UPDATE liekan_analysis_build b SET status='invalidated',error_code='analysis-epoch-changed',lease_token=NULL,lease_until=NULL,revision=b.revision+1
-      FROM liekan_analysis_site s WHERE s.website_id=b.website_id AND (s.epoch<>b.epoch OR s.mode<>'live') AND b.status IN('queued','running','paused')`);
+      FROM liekan_analysis_site s WHERE s.website_id=b.website_id AND (s.epoch<>b.epoch OR s.mode<>'live') AND b.status IN('queued','running','paused','failed','capacity_limited')`);
   });
-  const { queued } = await discoverAnalysisRollups(queueRecovery);
+  const recoveryAllowed = storageHistoryAllowed(
+    await analysisTransaction(tx => analysisCapacity(tx, null)),
+  );
+  const { queued } = await discoverAnalysisRollups(
+    (...args) => queueRecovery(...args, recoveryAllowed),
+    recoveryAllowed,
+  );
   await analysisTransaction(async tx => {
     await tx.$executeRawUnsafe(`DELETE FROM liekan_analysis_probe p WHERE (p.website_id,p.epoch,p.family,p.day) IN(
       SELECT f.website_id,f.epoch,f.family,f.day FROM liekan_analysis_probe f JOIN liekan_analysis_site s USING(website_id)
-      WHERE f.epoch<>s.epoch AND s.updated_at<clock_timestamp()-interval '7 days' LIMIT 2000)`);
-    // Obsolete epoch baselines expire only after seven days of site lifecycle inactivity.
-    await tx.$executeRawUnsafe(`DELETE FROM liekan_analysis_manifest m WHERE (m.website_id,m.epoch,m.family,m.bucket) IN(
-      SELECT f.website_id,f.epoch,f.family,f.bucket FROM liekan_analysis_manifest f JOIN liekan_analysis_site s USING(website_id)
       WHERE f.epoch<>s.epoch AND s.updated_at<clock_timestamp()-interval '7 days' LIMIT 2000)`);
     await tx.$executeRawUnsafe(`DELETE FROM liekan_analysis_dirty d WHERE (d.website_id,d.epoch,d.family,d.bucket,d.shard) IN(
       SELECT f.website_id,f.epoch,f.family,f.bucket,f.shard FROM liekan_analysis_dirty f JOIN liekan_analysis_site s USING(website_id)
       WHERE f.epoch<>s.epoch AND s.updated_at<clock_timestamp()-interval '7 days' LIMIT 2000)`);
     await tx.$executeRawUnsafe(`DELETE FROM liekan_analysis_meter m WHERE bytes=0 AND NOT EXISTS(
       SELECT 1 FROM liekan_analysis_site s WHERE s.website_id=m.website_id AND s.epoch=m.epoch)`);
-    // Collect at most 2000 unreachable generation rows per family on each reconciliation tick.
-    // Current and previous published generations, and active checkpoint generations, are retained.
-    for (const table of ['liekan_analysis_log', 'liekan_analysis_path', 'liekan_analysis_visit']) {
-      await tx.$executeRawUnsafe(`DELETE FROM ${table} t WHERE (t.tableoid,t.ctid) IN(SELECT f.tableoid,f.ctid FROM ${table} f
-        WHERE f.updated_at<clock_timestamp()-interval '7 days' AND NOT EXISTS(SELECT 1 FROM liekan_analysis_manifest m WHERE m.website_id=f.website_id AND (m.generation=f.generation OR m.previous_generation=f.generation))
-        AND NOT EXISTS(SELECT 1 FROM liekan_analysis_build b WHERE b.website_id=f.website_id AND b.checkpoint->>'generation'=f.generation::text AND (b.status IN('queued','running','paused') OR b.updated_at>clock_timestamp()-interval '7 days'))
-        AND EXISTS(SELECT 1 FROM liekan_analysis_build b WHERE b.website_id=f.website_id AND b.updated_at<clock_timestamp()-interval '7 days') LIMIT 2000)`);
-    }
-    const expired = await tx.$queryRawUnsafe<
-      { website_id: string; generation: string; estimated_bytes: bigint }[]
-    >(
-      `SELECT g.* FROM liekan_analysis_generation g WHERE g.updated_at<clock_timestamp()-interval '7 days'
-       AND NOT EXISTS(SELECT 1 FROM liekan_analysis_manifest m WHERE m.website_id=g.website_id AND (m.generation=g.generation OR m.previous_generation=g.generation))
-       AND NOT EXISTS(SELECT 1 FROM liekan_analysis_log f WHERE f.website_id=g.website_id AND f.generation=g.generation)
-       AND NOT EXISTS(SELECT 1 FROM liekan_analysis_path f WHERE f.website_id=g.website_id AND f.generation=g.generation)
-       AND NOT EXISTS(SELECT 1 FROM liekan_analysis_visit f WHERE f.website_id=g.website_id AND f.generation=g.generation)
-       AND NOT EXISTS(SELECT 1 FROM liekan_analysis_build b WHERE b.website_id=g.website_id AND b.checkpoint->>'generation'=g.generation::text AND b.status IN('queued','running','paused')) LIMIT 20 FOR UPDATE`,
-    );
-    for (const generation of expired) {
-      await tx.$executeRawUnsafe(
-        'DELETE FROM liekan_analysis_generation WHERE website_id=$1::uuid AND generation=$2::uuid',
-        generation.website_id,
-        generation.generation,
-      );
-      await tx.$executeRawUnsafe(
-        'UPDATE liekan_analysis_site SET derived_bytes=greatest(0,derived_bytes-$2::bigint) WHERE website_id=$1::uuid',
-        generation.website_id,
-        String(generation.estimated_bytes),
-      );
-    }
   });
   return { queued };
 }

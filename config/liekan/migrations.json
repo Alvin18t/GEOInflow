@@ -61,5 +61,14 @@
   "053_dashboard_execution_lane.sql": "702e4c9c58e11602980af78ec5ef6f108405b4b3baf71f542f9fea5efd560c28",
   "054_replay_eligibility_probe.sql": "c3167591787e73dc7c5ca788dedf0972884ad4febb1ac176e617f967f9d4e822",
   "055_account_preferences.sql": "2ca9d64ea90d03f85c34ac844b9a711cce4c4aced5006be158c90d63a5bdcec3",
-  "056_qualified_browser_metrics.sql": "2b223de098bf1ee6626ab9d9a4b3c10548069baa650fa341ea65377b44926dd4"
+  "056_qualified_browser_metrics.sql": "2b223de098bf1ee6626ab9d9a4b3c10548069baa650fa341ea65377b44926dd4",
+  "057_storage_retention.sql": "8dd7ccdbb92cf06ea2bda79acb68101ec8032f6810794a4b87bca9b8da4492c9",
+  "058_storage_physical_measurements.sql": "2511e95a84bfc7fde047d143c616b6559fe7c621f0c4bcf847ff7a8cc7a6d80e",
+  "059_completed_job_retention_guard.sql": "c4528358aa36100f438190c54b1ab5eef92560a733bf69813168385b15455c51",
+  "060_completed_job_policy_ownership.sql": "1df35dd222df805662250e75eb8c384e8df4ef1fda18e9e54c42ae24a34c4efa",
+  "061_storage_candidate_queue_identity.sql": "853687e93be7a7a1ed96b7b13c4c03ea8991ab92d5f4210b014dbacae885aeb6",
+  "062_dashboard_attempt_fingerprint.sql": "211191a4df31560c07771c19a26c453ef89365f096fe9582198e2cafc667be46",
+  "063_dashboard_import_dependencies.sql": "3fda0e27f15520337ae5d51040da3f1afca2c5022d9ad7f0f91d3483e44b1e09",
+  "064_dashboard_metadata_dependencies.sql": "7df545ee4bed6c89ce0a19913b2831c14a59d36ed5d358b7ee01518ce89bd9c2",
+  "065_dashboard_semantic_metadata.sql": "b440d0be3b60df3d14a4e173f756b89108dfa0d3f031e82b40f7cbafbe254467"
 }

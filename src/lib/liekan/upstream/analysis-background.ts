@@ -1,12 +1,13 @@
+import { randomUUID } from 'node:crypto';
 import {
+  type AnalysisPermit,
   analysisPermitTable,
   withinAnalysisPermit,
-  type AnalysisPermit,
 } from './analysis-permit-context';
-import { randomUUID } from 'node:crypto';
-import { dashboardAnalysisWorkSql } from './dashboard-demand';
-import { analysisTransaction } from './analysis-rollups-db';
+import { analysisCapacity, analysisTransaction } from './analysis-rollups-db';
 import { analysisBuildWaitingSql } from './analysis-rollups-model';
+import { dashboardAnalysisWorkSql } from './dashboard-demand';
+import { storageHistoryAllowed } from './storage-capacity';
 
 export type AnalysisWorkKind = 'interactive' | 'incremental' | 'history' | 'preheat' | 'dashboard';
 /** Database leases bound concurrent analysis across worker processes. Waiting holds no connection. */
@@ -88,16 +89,19 @@ export async function withAnalysisPermit<T>(
     clearInterval(renewal);
     owned = false;
     // Preserve remaining runnable demand before the next bounded unit checks fairness.
-    const waiting =
-      kind === 'incremental' || kind === 'history'
-        ? `,${kind}_waiting_at=${analysisBuildWaitingSql[kind]}`
-        : '';
-    await analysisTransaction(tx =>
-      tx.$executeRawUnsafe(
+    await analysisTransaction(async tx => {
+      let waiting = '';
+      if (kind === 'history') {
+        const capacity = await analysisCapacity(tx, null);
+        waiting = `,history_waiting_at=${analysisBuildWaitingSql.history(storageHistoryAllowed(capacity))}`;
+      } else if (kind === 'incremental') {
+        waiting = `,incremental_waiting_at=${analysisBuildWaitingSql.incremental}`;
+      }
+      await tx.$executeRawUnsafe(
         `UPDATE ${table} SET token=NULL,lease_until=NULL${waiting} WHERE id AND token=$1::uuid AND epoch=$2::bigint`,
         token,
         acquired.epoch,
-      ),
-    );
+      );
+    });
   }
 }

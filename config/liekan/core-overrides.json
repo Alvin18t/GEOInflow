@@ -307,7 +307,7 @@
     },
     {
       "path": "next.config.ts",
-      "purpose": "Typed production build, local font/branding and explicit agent rule control; externalize the pg driver for the website handle proxy; preserve private no-store headers for crawler recognition, candidates, administrator source health, crawler context and private traffic evidence; preserve private no-store headers for browser cache authorization manifests; preserve private no-store responses for durable analysis tasks, acceleration management and opted-in native aggregates",
+      "purpose": "Typed production build, local font/branding and explicit agent rule control; externalize the pg driver for the website handle proxy; preserve private no-store headers for crawler recognition, candidates, administrator source health, crawler context and private traffic evidence; preserve private no-store headers for browser cache authorization manifests; preserve private no-store responses for durable analysis tasks, acceleration management, instance and website storage cleanup, and opted-in native aggregates",
       "tests": [
         "pnpm liekan:verify",
         "Liekan Docker and visual acceptance",

@@ -12,7 +12,7 @@ import { staticRequestExtensionPattern } from './log-content-boundary';
 import {
   analysisTransaction,
   findAnalysisVersions,
-  logDimensionsSql,
+  analysisLogRawFactsSql,
   analysisVisitRowsSql,
 } from './analysis-rollups-db';
 import { browserPopulationMetadataSql, populationFromRow } from './browser-population';
@@ -307,16 +307,13 @@ export async function readAnalysisLogRollup(
       const [result] = await tx.$queryRawUnsafe<any[]>(
         `WITH ${coverageSql}, ${gapRangesSql('raw_gaps', 'covered', !modern)},
         path_covered AS MATERIALIZED(SELECT * FROM covered c WHERE ${analysisPathCoverageSql('c')}),
-        ${gapRangesSql('path_gaps', 'path_covered', !modern)}, raw_scope AS MATERIALIZED (
-         SELECT r.* FROM raw_gaps g CROSS JOIN LATERAL (
-          SELECT l.path,l.created_at,${logDimensionsSql} AS dimensions FROM liekan_reporting_log l
-          WHERE l.website_id=$1::uuid AND l.created_at>=g.starts AND l.created_at<g.ends OFFSET 0
-         ) r
+        ${gapRangesSql('path_gaps', 'path_covered', !modern)},
+        reporting_gaps AS MATERIALIZED(SELECT * FROM raw_gaps ${needsPaths ? 'UNION ALL SELECT * FROM path_gaps' : ''}),
+        ${analysisLogRawFactsSql('reporting_gaps')},
+        raw_scope AS MATERIALIZED (
+         SELECT * FROM reporting_facts WHERE created_at<@(SELECT range_agg(tstzrange(starts,ends,'[)')) FROM raw_gaps)
         ), path_scope AS MATERIALIZED (
-         SELECT r.* FROM path_gaps g CROSS JOIN LATERAL (
-          SELECT l.path,l.created_at,${logDimensionsSql} AS dimensions FROM liekan_reporting_log l
-          WHERE l.website_id=$1::uuid AND l.created_at>=g.starts AND l.created_at<g.ends OFFSET 0
-         ) r
+         SELECT * FROM reporting_facts WHERE created_at<@(SELECT range_agg(tstzrange(starts,ends,'[)')) FROM path_gaps)
         ), low_facts AS (
          SELECT f.bucket,f.dimensions,f.requests,f.first_at,f.last_at FROM liekan_analysis_log f JOIN covered c ON c.generation=f.generation AND c.website_id=f.website_id
          WHERE ${derivedBucketBounds} AND f.grain=${lowGrainSql}
@@ -439,14 +436,14 @@ function visitConditions(filters: Record<string, string>) {
     parts.push("(dimensions->>'sessionPresent')::boolean");
   return parts.join(' AND ') || 'true';
 }
-function visitFactsSql(inclusiveEnd = true, geography = true) {
+function visitFactsSql(inclusiveEnd = true, geography = true, observed = false) {
   const condition = `e.website_id=$1::uuid AND e.created_at>=$2::timestamptz AND e.created_at${inclusiveEnd ? '<=' : '<'}$3::timestamptz AND EXISTS(SELECT 1 FROM visit_gaps g WHERE e.created_at>=g.starts AND e.created_at<g.ends)`;
   return `${coverageSql}, ${gapRangesSql('visit_gaps', 'covered', inclusiveEnd)},
   ${boundedBrowserEventsSql(condition, { geography, environment: true, ranges: 'visit_gaps' })}, raw_scope AS MATERIALIZED (
    SELECT e.session_id,e.visit_id,e.hostname,e.dimensions,
     count(*) AS eligible_events,count(*) FILTER(WHERE e.event_type NOT IN(2,5)) AS pageviews,bool_or(e.event_type=2) AS has_custom,
     min(e.created_at) FILTER(WHERE e.event_type NOT IN(2,5)) AS min_time,max(e.created_at) FILTER(WHERE e.event_type NOT IN(2,5)) AS max_time
-   FROM (${analysisVisitRowsSql(condition, 'bounded_events', geography)}) e
+   FROM (${analysisVisitRowsSql(condition, 'bounded_events', geography, observed)}) e
    GROUP BY e.session_id,e.visit_id,e.hostname,e.dimensions
  ), observed_facts AS MATERIALIZED (
   SELECT f.session_id,f.visit_id,f.hostname,f.dimensions,f.eligible_events,f.pageviews,f.has_custom,f.min_time,f.max_time
@@ -477,7 +474,7 @@ export async function readAnalysisVisitPopulation(
     const versions = await pinnedReadVersions(tx, input.websiteId);
     if (!versions || !(await hasCoveredManifest(tx, input, 'visit', versions))) return null;
     const [row] = await tx.$queryRawUnsafe<Record<string, any>[]>(
-      `WITH ${visitFactsSql(!input.halfOpen)}, population_facts AS MATERIALIZED (
+      `WITH ${visitFactsSql(!input.halfOpen, false, true)}, population_facts AS MATERIALIZED (
        SELECT session_id,eligible_events,pageviews,dimensions FROM observed_facts
        ) SELECT ${browserPopulationMetadataSql},'qualified-browser' AS "metricScope",
        coalesce(sum(eligible_events),0)::text AS "eligibleEvents",
@@ -652,11 +649,9 @@ export async function readAnalysisLogSeries(
       const rows = await tx.$queryRawUnsafe<
         { day: string; bot: string; type: string; count: string; aiRequests: string }[]
       >(
-        `WITH ${coverageSql}, ${gapRangesSql('series_gaps', 'covered', !modern)}, raw_scope AS MATERIALIZED (
-          SELECT r.* FROM series_gaps g CROSS JOIN LATERAL (
-           SELECT l.created_at,${logDimensionsSql} AS dimensions FROM liekan_reporting_log l
-           WHERE l.website_id=$1::uuid AND l.created_at>=g.starts AND l.created_at<g.ends OFFSET 0
-          ) r
+        `WITH ${coverageSql}, ${gapRangesSql('series_gaps', 'covered', !modern)},
+        ${analysisLogRawFactsSql('series_gaps')}, raw_scope AS MATERIALIZED (
+          SELECT created_at,dimensions FROM reporting_facts
         ), low_facts AS (
           SELECT f.bucket,f.dimensions,f.requests FROM liekan_analysis_log f JOIN covered c ON c.generation=f.generation AND c.website_id=f.website_id WHERE ${derivedBucketBounds} AND f.grain=${lowGrainSql}
           UNION ALL SELECT date_bin(interval '5 minutes',created_at,timestamptz '2000-01-01Z'),dimensions,count(*) FROM raw_scope GROUP BY 1,2

@@ -66,6 +66,22 @@ export const operations = {
     queryParams: [],
     hasBody: false,
   },
+  changeLiekanInstanceStorage: {
+    operationId: 'changeLiekanInstanceStorage',
+    method: 'post',
+    path: '/api/liekan/storage',
+    pathParams: [],
+    queryParams: ['runId'],
+    hasBody: true,
+  },
+  changeLiekanWebsiteStorage: {
+    operationId: 'changeLiekanWebsiteStorage',
+    method: 'post',
+    path: '/api/liekan/websites/{websiteId}/storage',
+    pathParams: ['websiteId'],
+    queryParams: ['runId'],
+    hasBody: true,
+  },
   cloneBoard: {
     operationId: 'cloneBoard',
     method: 'post',
@@ -1138,6 +1154,14 @@ export const operations = {
     queryParams: ['view', 'generation', 'page', 'pageSize', 'cursor'],
     hasBody: false,
   },
+  getLiekanInstanceStorage: {
+    operationId: 'getLiekanInstanceStorage',
+    method: 'get',
+    path: '/api/liekan/storage',
+    pathParams: [],
+    queryParams: ['runId'],
+    hasBody: false,
+  },
   getLiekanJourneyDetails: {
     operationId: 'getLiekanJourneyDetails',
     method: 'get',
@@ -1296,6 +1320,14 @@ export const operations = {
       'page',
       'cursor',
     ],
+    hasBody: false,
+  },
+  getLiekanWebsiteStorage: {
+    operationId: 'getLiekanWebsiteStorage',
+    method: 'get',
+    path: '/api/liekan/websites/{websiteId}/storage',
+    pathParams: ['websiteId'],
+    queryParams: ['runId'],
     hasBody: false,
   },
   getLiekanWebsiteSummary: {
@@ -3862,6 +3894,28 @@ export abstract class GeneratedUmamiClient {
   }
 
   /**
+   * Manage safe storage retention with a complete private session
+   * `POST /api/liekan/storage`
+   */
+  changeLiekanInstanceStorage(
+    input: OperationInput<'changeLiekanInstanceStorage'>,
+    options?: RequestOptions,
+  ): Promise<OperationOutput<'changeLiekanInstanceStorage'>> {
+    return this.execute('changeLiekanInstanceStorage', input, options);
+  }
+
+  /**
+   * Manage safe storage retention with a complete private session
+   * `POST /api/liekan/websites/{websiteId}/storage`
+   */
+  changeLiekanWebsiteStorage(
+    input: OperationInput<'changeLiekanWebsiteStorage'>,
+    options?: RequestOptions,
+  ): Promise<OperationOutput<'changeLiekanWebsiteStorage'>> {
+    return this.execute('changeLiekanWebsiteStorage', input, options);
+  }
+
+  /**
    * Clone a board
    * Creates a copy of a board with optional changes to its name, description, and configuration. Removes invalid report references from the copy.
    * `POST /api/boards/{boardId}/clone`
@@ -4759,6 +4813,17 @@ export abstract class GeneratedUmamiClient {
   }
 
   /**
+   * Manage safe storage retention with a complete private session
+   * `GET /api/liekan/storage`
+   */
+  getLiekanInstanceStorage(
+    input?: OperationInput<'getLiekanInstanceStorage'>,
+    options?: RequestOptions,
+  ): Promise<OperationOutput<'getLiekanInstanceStorage'>> {
+    return this.execute('getLiekanInstanceStorage', input, options);
+  }
+
+  /**
    * 查询路径关联会话
    * `GET /api/liekan/websites/{websiteId}/journeys/details`
    */
@@ -4855,6 +4920,17 @@ export abstract class GeneratedUmamiClient {
     options?: RequestOptions,
   ): Promise<OperationOutput<'getLiekanTrafficQuality'>> {
     return this.execute('getLiekanTrafficQuality', input, options);
+  }
+
+  /**
+   * Manage safe storage retention with a complete private session
+   * `GET /api/liekan/websites/{websiteId}/storage`
+   */
+  getLiekanWebsiteStorage(
+    input: OperationInput<'getLiekanWebsiteStorage'>,
+    options?: RequestOptions,
+  ): Promise<OperationOutput<'getLiekanWebsiteStorage'>> {
+    return this.execute('getLiekanWebsiteStorage', input, options);
   }
 
   /**
