@@ -1,9 +1,13 @@
 import { execFileSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, realpathSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
-import { fileURLToPath } from 'node:url';
-import { checkPublicHistory, git, readPolicy } from './liekan-public-history.mjs';
+import { join } from 'node:path';
+import {
+  checkPublicationRemotes,
+  checkPublicHistory,
+  git,
+  readPolicy,
+} from './liekan-public-history.mjs';
 
 function ancestor(repo, older, newer) {
   try {
@@ -61,14 +65,7 @@ export function preparePublicPublication({
       .includes(`branch refs/heads/${branch}`)
   )
     throw new Error('Publication branch is checked out in another worktree');
-  const remotes = git(target, ['remote']).split('\n');
-  if (remotes.length !== 1 || remotes[0] !== 'origin')
-    throw new Error('Public checkout must have only its GitHub origin remote');
-  for (const kind of [[], ['--push']]) {
-    const urls = git(target, ['remote', 'get-url', ...kind, '--all', 'origin']).split('\n');
-    if (urls.length !== 1 || urls[0] !== policy.repository)
-      throw new Error('Public origin does not match the approved GitHub repository');
-  }
+  checkPublicationRemotes(target, policy);
   const localRefs = git(target, [
     'for-each-ref',
     '--format=%(refname)',
@@ -197,19 +194,51 @@ export function preparePublicPublication({
   }
 }
 
-if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+export function deliverPublicPublication({ target, branch, commit, policy = readPolicy() }) {
+  if (!branch?.startsWith('feature/'))
+    throw new Error('Publication branch must start with feature/');
+  git(target, ['check-ref-format', '--branch', branch]);
+  if (git(target, ['rev-parse', `refs/heads/${branch}^{commit}`]) !== commit)
+    throw new Error('Prepared public candidate changed before delivery');
+  checkPublicationRemotes(target, policy, { requireMirror: true });
+  checkPublicHistory({ repo: target, refs: [commit], policy });
+  const deliveries = [];
+  for (const remote of ['origin', 'gitee']) {
+    try {
+      git(target, ['push', remote, `${commit}:refs/heads/${branch}`]);
+      const actual = git(target, ['ls-remote', remote, `refs/heads/${branch}`]).split(/\s+/)[0];
+      if (actual !== commit)
+        throw new Error('Remote revision does not match the prepared candidate');
+      deliveries.push({ remote, commit, delivered: true });
+    } catch {
+      // Preserve the candidate and attempt both authorized destinations after a partial failure.
+      deliveries.push({ remote, commit, delivered: false });
+    }
+  }
+  return { delivered: deliveries.every(result => result.delivered), deliveries };
+}
+
+if (typeof import.meta.main !== 'boolean')
+  throw new Error('Run GEOInflow publication with the Node.js version pinned in .nvmrc');
+
+if (import.meta.main) {
   try {
     const options = {};
+    let push = false;
     const args = process.argv.slice(2);
     for (let i = 0; i < args.length; i++) {
       if (args[i] === '--help') {
         console.log(
-          'Usage: node scripts/liekan-publish-public.mjs --target DIR --branch feature/NAME [--source-ref REF]',
+          'Usage: node scripts/liekan-publish-public.mjs --target DIR --branch feature/NAME [--source-ref REF] [--push]',
         );
         console.log(
-          'Prepares a local commit from tracked source files. Push the feature branch normally and merge through a checked GitHub pull request.',
+          'Prepares a local commit from tracked source files. --push delivers the same candidate to GitHub and clean Gitee. Merge through a checked GitHub pull request.',
         );
         process.exit(0);
+      }
+      if (args[i] === '--push') {
+        push = true;
+        continue;
       }
       const key = { '--target': 'target', '--branch': 'branch', '--source-ref': 'sourceRef' }[
         args[i]
@@ -219,7 +248,16 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
       if (!value || value.startsWith('-')) throw new Error(`Missing value for ${args[i - 1]}`);
       options[key] = value;
     }
-    console.log(JSON.stringify(preparePublicPublication(options)));
+    const result = preparePublicPublication(options);
+    if (
+      push &&
+      (result.changed ||
+        refExists(options.target, `refs/heads/${options.branch}`) === result.commit)
+    )
+      Object.assign(result, deliverPublicPublication({ ...options, ...result }));
+    else if (push) result.skipped = 'Source already matches project main';
+    console.log(JSON.stringify(result));
+    if (push && !result.skipped && !result.delivered) process.exitCode = 1;
   } catch (error) {
     console.error(error.message);
     process.exitCode = 1;

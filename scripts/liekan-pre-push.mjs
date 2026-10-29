@@ -1,6 +1,6 @@
 import { spawnSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
-import { checkPublicHistory, git, readPolicy } from './liekan-public-history.mjs';
+import { checkPublicHistory, git, readPolicy, repositoryKey } from './liekan-public-history.mjs';
 
 export function gitConfig(repo, args) {
   const env = Object.fromEntries(
@@ -65,6 +65,9 @@ export function destinationHost(address) {
       const url = new URL(address);
       return {
         host: url.hostname.toLowerCase(),
+        path: decodeURIComponent(url.pathname)
+          .replace(/^\/+|\/+$/g, '')
+          .replace(/\.git$/, ''),
         ssh: ['ssh:', 'git+ssh:', 'ssh+git:'].includes(url.protocol),
         user: decodeURIComponent(url.username),
         port: url.port,
@@ -73,12 +76,20 @@ export function destinationHost(address) {
       throw new Error('Invalid push destination address');
     }
   }
-  const scp = address.match(/^(?:([^/@\s:]+)@)?([^/:\s]+):[^\s]/);
-  return scp ? { host: scp[2].toLowerCase(), user: scp[1], ssh: true } : null;
+  const scp = address.match(/^(?:([^/@\s:]+)@)?([^/:\s]+):([^\s]+)/);
+  return scp
+    ? {
+        host: scp[2].toLowerCase(),
+        user: scp[1],
+        ssh: true,
+        path: decodeURIComponent(scp[3])
+          .replace(/^\/+|\/+$/g, '')
+          .replace(/\.git$/, ''),
+      }
+    : null;
 }
 
-export function isGitHubPush({ repo, remoteName, remoteLocation, resolveSshHost }) {
-  resolveSshHost ||= (host, address) => sshHostname(repo, host, address);
+function pushAddresses({ repo, remoteName, remoteLocation }) {
   const addresses = [remoteName, remoteLocation];
   if (/^[\w.-]+$/.test(remoteName)) {
     for (const key of ['pushurl', 'url']) {
@@ -91,7 +102,13 @@ export function isGitHubPush({ repo, remoteName, remoteLocation, resolveSshHost 
       }
     }
   }
-  const parsed = addresses.map(destinationHost).filter(Boolean);
+  return addresses.map(destinationHost).filter(Boolean);
+}
+
+export function isGitHubPush(options) {
+  const parsed = pushAddresses(options);
+  const resolveSshHost =
+    options.resolveSshHost || ((host, address) => sshHostname(options.repo, host, address));
   const github = host => {
     const normalized = host.toLowerCase().replace(/\.$/, '');
     return normalized === 'github.com' || normalized.endsWith('.github.com');
@@ -101,6 +118,31 @@ export function isGitHubPush({ repo, remoteName, remoteLocation, resolveSshHost 
     if (address.ssh && github(resolveSshHost(address.host, address))) return true;
   }
   return false;
+}
+
+export function projectPushDestination(options) {
+  const policy = options.policy || readPolicy();
+  const parsed = pushAddresses(options);
+  const resolveHost =
+    options.resolveSshHost || ((host, address) => sshHostname(options.repo, host, address));
+  const development = repositoryKey(policy.developmentRepository || '');
+  let github = false;
+  let gitee = false;
+  for (const address of parsed) {
+    const hosts = [address.host];
+    // Inspect literal hosts first; a rewrite must not remove an existing safeguard.
+    if (address.ssh) hosts.push(resolveHost(address.host, address));
+    for (const rawHost of hosts) {
+      const host = rawHost.toLowerCase().replace(/\.$/, '');
+      if (host === 'github.com' || host.endsWith('.github.com')) github = true;
+      if (
+        (host === 'gitee.com' || host.endsWith('.gitee.com')) &&
+        `${host}/${address.path}` !== development
+      )
+        gitee = true;
+    }
+  }
+  return { github, gitee, protected: github || gitee };
 }
 
 export function checkPush({
@@ -115,13 +157,20 @@ export function checkPush({
   if (!['development', 'public'].includes(role))
     throw new Error('Invalid installed push-guard role');
   if (!remoteName || !remoteLocation) throw new Error('Missing Git push destination');
-  if (!isGitHubPush({ repo, remoteName, remoteLocation, resolveSshHost }))
-    return { checked: 0, github: false };
+  policy ||= readPolicy();
+  const destination = projectPushDestination({
+    repo,
+    remoteName,
+    remoteLocation,
+    resolveSshHost,
+    policy,
+  });
+  if (!destination.protected) return { checked: 0, github: false };
   const lines = input.split(/\r?\n/).filter(line => line.trim());
   if (!lines.length) return { checked: 0, github: true };
   if (role === 'development')
     throw new Error(
-      'GitHub pushes require the independent public checkout; development history stays on Gitee',
+      'GitHub and clean Gitee pushes require the independent public checkout; full history belongs in the private development repository',
     );
   const commits = [];
   for (const line of lines) {
@@ -132,6 +181,13 @@ export function checkPush({
       !/^[a-f0-9]{40,64}$/.test(fields[3])
     )
       throw new Error('Invalid pre-push reference record');
+    if (destination.gitee && fields[2] === 'refs/heads/main') {
+      const expected = git(repo, ['ls-remote', policy.repository, 'refs/heads/main']).split(
+        /\s+/,
+      )[0];
+      if (!/^[a-f0-9]{40,64}$/.test(expected) || fields[1] !== expected)
+        throw new Error('Gitee main must match the protected GitHub main exactly');
+    }
     if (!/^0+$/.test(fields[1])) commits.push(fields[1]);
   }
   if (commits.length)

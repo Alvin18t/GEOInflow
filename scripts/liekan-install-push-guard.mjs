@@ -17,7 +17,7 @@ import {
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { gitConfig } from './liekan-pre-push.mjs';
-import { defaultPolicyPath, git, readPolicy } from './liekan-public-history.mjs';
+import { defaultPolicyPath, git, readPolicy, repositoryKey } from './liekan-public-history.mjs';
 
 const marker = '# GEOInflow managed pre-push v1';
 const sourceDirectory = dirname(fileURLToPath(import.meta.url));
@@ -37,13 +37,15 @@ function ensureDirectory(path) {
 
 export function installPushGuard({ repo = process.cwd(), policyPath = defaultPolicyPath } = {}) {
   repo = realpathSync(repo);
-  readPolicy(policyPath);
+  const policy = readPolicy(policyPath);
   const origin = gitConfig(repo, ['--get', 'remote.origin.url']);
   const role =
-    /^git@gitee\.com:liekan\/liekan-statistics(?:\.git)?\/?$/.test(origin) ||
-    /^https:\/\/gitee\.com\/liekan\/liekan-statistics(?:\.git)?\/?$/.test(origin)
+    policy.developmentRepository &&
+    repositoryKey(origin) === repositoryKey(policy.developmentRepository)
       ? 'development'
-      : origin === readPolicy(policyPath).repository
+      : [policy.repository, policy.mirrorRepository]
+            .filter(Boolean)
+            .some(url => repositoryKey(origin) === repositoryKey(url))
         ? 'public'
         : null;
   if (!role)
