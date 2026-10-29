@@ -17,6 +17,32 @@ NODE
 
 该命令将上游基线写入本地对象库，公开分支的提交历史保持独立。GitHub 源码检查已包含这一步。开发维护中的上游合并需要保留共同祖先的完整开发历史。
 
+## GitHub 独立发布
+
+开发仓库保留 Gitee 的完整提交历史，用于功能开发和上游升级。GitHub 公开仓库沿用独立的 GEOInflow 历史。两边同步同一版本的源码，各自维护提交编号。开发目录的 GitHub remote 仅用于读取；将其推送地址设置为 `disabled://geoinflow-use-public-checkout`，日常推送通过 Gitee 的 `origin` 完成。
+
+首次准备公共目录时，单独克隆 GitHub 仓库。公共目录只保留 GitHub `origin`，保持在干净的 `main` 分支。开发修改提交并验证后，在开发目录运行：
+
+```sh
+pnpm liekan:publish-public --target /path/to/GEOInflow-public --branch feature/your-change --source-ref HEAD
+pnpm liekan:check-public-history --repo /path/to/GEOInflow-public refs/heads/feature/your-change
+git -C /path/to/GEOInflow-public push origin feature/your-change
+```
+
+发布工具在临时目录导出指定提交中的完整文件，核对源码树摘要，将候选提交接到公共分支上。工具只准备本地 `feature/*` 提交，推送使用普通快进方式。公共目录的工作文件和 `main` 保持原样。重复导出相同源码不会生成额外提交。候选提交记录开发提交和源码树摘要，便于跨仓库追溯。
+
+GitHub 新增的独立贡献需要先同步回开发仓库。工具通过三方合并检查确认源码已包含公共改动；发生冲突或缺失时会停止，保留公共文件和分支。已准备的候选可在排查推送错误后直接重试普通推送。发布前运行 `git -C /path/to/GEOInflow-public fetch --no-tags origin` 和 `git -C /path/to/GEOInflow-public merge --ff-only origin/main`，保持本地 main 与远端一致。已合入 main 的旧候选可继续快进；未合并且落后 main 的候选需要先协调或使用新分支。保留尚未推送的本地候选。若工具返回 `changed: false`，源码已同步，可跳过推送。
+
+`config/liekan/public-history.json` 固定公开项目允许的根提交和首次独立发布基线。历史检查遍历全部父节点，拒绝额外历史根、可达的浅克隆边界和 grafts，忽略本地 replace 规则。它允许社区贡献者从项目分支继续提交。
+
+GitHub `main` 启用分支保护：通过 PR 合并，必过检查为 `GEOInflow public history`，管理员同样受限，禁止强制推送和删除。PR 检查由 `pull_request_target` 的受信工作流执行，使用目标分支的检查器、策略和测试，只获取候选提交图；独立报告步骤将必过状态写到候选 head SHA，读取候选的步骤只有只读权限。公开仓库的常规 PR 无需导入开发祖先。历史污染回归测试使用独立临时仓库，覆盖干净提交、第二父节点带入上游、浅克隆、replace 遮蔽、完整导出、重复执行以及公共改动保护：
+
+```sh
+node --test tests/liekan/public-history.test.mjs
+```
+
+上游比较所需的浅层基线可以获取到本地对象库；它保持在公开分支祖先之外。处理上游升级时，在开发仓库完成合并和验收，再通过上述流程发布源码。保留 MIT 许可、原始版权、来源说明和完整示例数据包。
+
 ## 开发仓库的升级流程
 
 1. 在现有运行版本导出数据库备份，保留镜像 ID、标签、APP_SECRET 和 TWO_FACTOR_ENCRYPTION_KEY。环境配置和备份放私有位置。
