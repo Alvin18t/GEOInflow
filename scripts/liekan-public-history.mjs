@@ -23,6 +23,11 @@ export function readPolicy(path = defaultPolicyPath) {
   if (
     policy.version !== 1 ||
     !/^https:\/\/github\.com\/[\w.-]+\/[\w.-]+\.git$/.test(policy.repository) ||
+    (policy.mirrorRepository !== undefined &&
+      !/^https:\/\/gitee\.com\/[\w.-]+\/[\w.-]+\.git$/.test(policy.mirrorRepository)) ||
+    (policy.developmentRepository !== undefined &&
+      (!/^https:\/\/gitee\.com\/[\w.-]+\/[\w.-]+\.git$/.test(policy.developmentRepository) ||
+        policy.developmentRepository === policy.mirrorRepository)) ||
     !/^[a-f0-9]{40}$/.test(policy.baseline) ||
     !Array.isArray(policy.allowedRoots) ||
     policy.allowedRoots.length === 0 ||
@@ -30,6 +35,41 @@ export function readPolicy(path = defaultPolicyPath) {
   )
     throw new Error('Invalid public history policy');
   return policy;
+}
+
+export function repositoryKey(address) {
+  const normalized = address.replace(/^git@([^:]+):/, 'https://$1/');
+  try {
+    const url = new URL(normalized);
+    if (!['https:', 'ssh:', 'git+ssh:', 'ssh+git:'].includes(url.protocol)) return null;
+    return `${url.hostname.toLowerCase().replace(/\.$/, '')}/${decodeURIComponent(url.pathname)
+      .replace(/^\/+|\/+$/g, '')
+      .replace(/\.git$/, '')}`;
+  } catch {
+    return null;
+  }
+}
+
+export function checkPublicationRemotes(repo, policy, { requireMirror = false } = {}) {
+  const remotes = git(repo, ['remote']).split('\n');
+  const expected = { origin: policy.repository };
+  if (policy.mirrorRepository) expected.gitee = policy.mirrorRepository;
+  if (
+    !remotes.includes('origin') ||
+    remotes.some(remote => !Object.hasOwn(expected, remote)) ||
+    (requireMirror && !remotes.includes('gitee'))
+  )
+    throw new Error('Public checkout must have only its GitHub origin and approved Gitee mirror');
+  for (const remote of remotes) {
+    for (const kind of [[], ['--push']]) {
+      const urls = git(repo, ['remote', 'get-url', ...kind, '--all', remote]).split('\n');
+      if (urls.length !== 1 || repositoryKey(urls[0]) !== repositoryKey(expected[remote]))
+        throw new Error(
+          `Public ${remote} does not match the approved ${remote === 'origin' ? 'GitHub' : 'Gitee'} repository`,
+        );
+    }
+  }
+  return remotes;
 }
 
 export function checkPublicHistory({

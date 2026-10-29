@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { execFileSync, spawnSync } from 'node:child_process';
 import {
   chmodSync,
+  cpSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -13,7 +14,10 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { test } from 'node:test';
 import { checkPublicHistory, git } from '../../scripts/liekan-public-history.mjs';
-import { preparePublicPublication } from '../../scripts/liekan-publish-public.mjs';
+import {
+  deliverPublicPublication,
+  preparePublicPublication,
+} from '../../scripts/liekan-publish-public.mjs';
 
 function fixture(t) {
   const root = mkdtempSync(join(tmpdir(), 'geoinflow-history-test-'));
@@ -44,6 +48,8 @@ function fixture(t) {
   const policy = {
     version: 1,
     repository: 'https://github.com/yaojingang/GEOInflow.git',
+    mirrorRepository: 'https://gitee.com/liekan/liekan-statistics.git',
+    developmentRepository: 'https://gitee.com/liekan/liekan-statistics-history.git',
     baseline,
     allowedRoots: [baseline],
   };
@@ -232,4 +238,112 @@ test('CI requires the public history gate without path filters', () => {
   assert.match(workflow, /sha: process\.env\.CANDIDATE/);
   assert.match(workflow, /if: always\(\) && github\.event_name == 'pull_request_target'/);
   assert.doesNotMatch(workflow, /paths(?:-ignore)?:/);
+});
+
+test('dual publication uses identical commits and preserves candidates on partial failure', t => {
+  const f = fixture(t);
+  f.commit(f.source, 'new source', { 'app.txt': 'new feature\n' });
+  git(f.target, ['remote', 'add', 'gitee', f.policy.mirrorRepository]);
+  const servers = ['github.git', 'gitee.git'].map(name => join(f.root, name));
+  for (const server of servers) {
+    git(f.root, ['init', '--bare', '--initial-branch=main', server]);
+  }
+  const candidate = f.prepare();
+  const actualGit = spawnSync('which', ['git'], { encoding: 'utf8' }).stdout.trim();
+  const shim = join(f.root, 'git');
+  writeFileSync(
+    shim,
+    `#!${process.execPath}
+import {spawnSync} from 'node:child_process';
+const args=process.argv.slice(2);
+const command=args.indexOf('push')>=0?'push':args.indexOf('ls-remote')>=0?'ls-remote':null;
+if(command){
+ const i=args.indexOf(command)+1;
+ if(args[i]==='origin')args[i]=${JSON.stringify(servers[0])};
+ if(args[i]==='gitee')args[i]=${JSON.stringify(servers[1])};
+}
+const result=spawnSync(${JSON.stringify(actualGit)},args,{stdio:'inherit'});
+process.exit(result.status??1);
+`,
+    { mode: 0o755 },
+  );
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${f.root}:${oldPath}`;
+  t.after(() => {
+    process.env.PATH = oldPath;
+  });
+  const delivered = deliverPublicPublication({ target: f.target, ...candidate, policy: f.policy });
+  assert.equal(delivered.delivered, true);
+  for (const server of servers)
+    assert.equal(git(server, ['rev-parse', 'refs/heads/feature/publication']), candidate.commit);
+  assert.equal(
+    deliverPublicPublication({ target: f.target, ...candidate, policy: f.policy }).delivered,
+    true,
+  );
+  const conflict = git(
+    servers[1],
+    [
+      '-c',
+      'user.name=fixture',
+      '-c',
+      'user.email=fixture@example.test',
+      'commit-tree',
+      git(f.target, ['rev-parse', `${candidate.commit}^{tree}`]),
+    ],
+    { input: 'unrelated mirror change\n' },
+  );
+  git(servers[1], ['update-ref', 'refs/heads/feature/publication', conflict]);
+  const partial = deliverPublicPublication({ target: f.target, ...candidate, policy: f.policy });
+  assert.equal(partial.delivered, false);
+  assert.deepEqual(
+    partial.deliveries.map(x => x.delivered),
+    [true, false],
+  );
+  assert.equal(git(servers[1], ['rev-parse', 'refs/heads/feature/publication']), conflict);
+  assert.equal(git(f.target, ['rev-parse', 'refs/heads/feature/publication']), candidate.commit);
+});
+
+test('CLI skips an already merged candidate without advancing an old feature reference', t => {
+  const f = fixture(t);
+  f.commit(f.source, 'new source', { 'app.txt': 'latest source\n' });
+  const old = f.prepare();
+  git(f.target, ['update-ref', 'refs/heads/main', old.commit]);
+  git(f.target, ['reset', '--hard', 'main']);
+  git(f.target, ['commit', '--allow-empty', '-m', 'accepted merge']);
+  const main = git(f.target, ['rev-parse', 'HEAD']);
+  git(f.target, ['update-ref', 'refs/remotes/origin/main', main]);
+  mkdirSync(join(f.root, 'scripts'));
+  mkdirSync(join(f.root, 'config', 'liekan'), { recursive: true });
+  for (const file of ['liekan-public-history.mjs', 'liekan-publish-public.mjs'])
+    cpSync(resolve('scripts', file), join(f.root, 'scripts', file));
+  writeFileSync(join(f.root, 'config', 'liekan', 'public-history.json'), JSON.stringify(f.policy));
+  const run = spawnSync(
+    process.execPath,
+    [
+      join(f.root, 'scripts', 'liekan-publish-public.mjs'),
+      '--target',
+      f.target,
+      '--source-ref',
+      'HEAD',
+      '--branch',
+      'feature/publication',
+      '--push',
+    ],
+    { cwd: f.source, encoding: 'utf8' },
+  );
+  assert.equal(run.status, 0, run.stderr);
+  assert.equal(JSON.parse(run.stdout).skipped, 'Source already matches project main');
+  assert.equal(git(f.target, ['rev-parse', 'refs/heads/feature/publication']), old.commit);
+  assert.equal(git(f.target, ['rev-parse', 'HEAD']), main);
+});
+
+test('delivery rejects a concurrently changed prepared branch before either push', t => {
+  const f = fixture(t);
+  f.commit(f.source, 'new feature', { 'app.txt': 'new feature\n' });
+  const candidate = f.prepare();
+  git(f.target, ['update-ref', 'refs/heads/feature/publication', f.baseline]);
+  assert.throws(
+    () => deliverPublicPublication({ target: f.target, ...candidate, policy: f.policy }),
+    /candidate changed before delivery/,
+  );
 });

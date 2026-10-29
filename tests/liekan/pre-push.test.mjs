@@ -20,7 +20,8 @@ import { checkPush, isGitHubPush } from '../../scripts/liekan-pre-push.mjs';
 import { git } from '../../scripts/liekan-public-history.mjs';
 
 const github = 'https://github.com/yaojingang/GEOInflow.git';
-const gitee = 'git@gitee.com:liekan/liekan-statistics.git';
+const gitee = 'https://gitee.com/liekan/liekan-statistics.git';
+const development = 'git@gitee.com:liekan/liekan-statistics-history.git';
 const zero = '0'.repeat(40);
 
 function fixture(t, role = 'public') {
@@ -44,10 +45,17 @@ function fixture(t, role = 'public') {
     input: 'mixed history\n',
   });
   git(repo, ['update-ref', 'refs/heads/feature/dirty', dirty]);
-  git(repo, ['remote', 'add', 'origin', role === 'public' ? github : gitee]);
-  git(repo, ['config', `url.${server}.insteadOf`, role === 'public' ? github : gitee]);
+  git(repo, ['remote', 'add', 'origin', role === 'public' ? github : development]);
+  git(repo, ['config', `url.${server}.insteadOf`, role === 'public' ? github : development]);
   git(repo, ['config', '--add', `url.${server}.insteadOf`, github]);
-  const policy = { version: 1, repository: github, baseline: clean, allowedRoots: [clean] };
+  const policy = {
+    version: 1,
+    repository: github,
+    mirrorRepository: gitee,
+    developmentRepository: 'https://gitee.com/liekan/liekan-statistics-history.git',
+    baseline: clean,
+    allowedRoots: [clean],
+  };
   const policyPath = join(root, 'policy.json');
   writeFileSync(policyPath, JSON.stringify(policy));
   const install = () => installPushGuard({ repo, policyPath });
@@ -466,4 +474,51 @@ test('effective Git SSH configuration and command precedence identify routed ali
     () => isGitHubPush({ repo: f.repo, remoteName: address, remoteLocation: address }),
     /Unsupported custom SSH command/,
   );
+});
+
+test('clean Gitee URLs, alternate remotes, rewrites and SSH aliases reject development ancestry', t => {
+  const f = fixture(t, 'development');
+  f.install();
+  for (const address of [
+    gitee,
+    'git@gitee.com:liekan/liekan-statistics.git',
+    'ssh://git@gitee.com/liekan/liekan-statistics.git',
+  ]) {
+    git(f.repo, ['config', '--add', `url.${f.server}.insteadOf`, address]);
+    const bad = f.push(address, `${f.dirty}:refs/heads/feature/mixed`);
+    assert.notEqual(bad.status, 0, address);
+    assert.match(bad.stderr, /independent public checkout/);
+  }
+  git(f.repo, ['remote', 'add', 'another', gitee]);
+  assert.notEqual(f.push('another', `${f.dirty}:refs/heads/feature/another`).status, 0);
+  const config = join(f.root, 'gitee ssh config');
+  writeFileSync(config, 'Host geoinflow-gitee\n  HostName gitee.com\n');
+  git(f.repo, ['config', 'core.sshCommand', `ssh -F '${config}'`]);
+  const alias = 'ssh://git@geoinflow-gitee/liekan/liekan-statistics.git';
+  git(f.repo, ['config', '--add', `url.${f.server}.insteadOf`, alias]);
+  assert.notEqual(f.push(alias, `${f.clean}:refs/heads/feature/alias`).status, 0);
+  assert.equal(f.push('origin', `${f.dirty}:refs/heads/feature/archive`).status, 0);
+  assert.equal(f.remoteRef('refs/heads/feature/mixed'), null);
+  assert.equal(f.remoteRef('refs/heads/feature/archive'), f.dirty);
+});
+
+test('public Gitee rejects mixed ancestry and main follows protected GitHub main', t => {
+  const f = fixture(t);
+  f.install();
+  git(f.repo, ['remote', 'add', 'gitee', gitee]);
+  git(f.repo, ['config', '--add', `url.${f.server}.insteadOf`, gitee]);
+  assert.equal(f.push('origin', `${f.clean}:refs/heads/main`).status, 0);
+  assert.notEqual(f.push('gitee', `${f.dirty}:refs/heads/feature/mixed`).status, 0);
+  assert.equal(f.push('gitee', `${f.clean}:refs/heads/feature/clean`).status, 0);
+  const later = git(
+    f.repo,
+    ['commit-tree', git(f.repo, ['rev-parse', 'HEAD^{tree}']), '-p', f.clean],
+    { input: 'later candidate\n' },
+  );
+  const badMain = f.push('gitee', `${later}:refs/heads/main`);
+  assert.notEqual(badMain.status, 0);
+  assert.match(badMain.stderr, /must match the protected GitHub main/);
+  assert.equal(f.push('gitee', `${f.clean}:refs/heads/main`).status, 0);
+  assert.notEqual(f.push('gitee', ':refs/heads/main').status, 0);
+  assert.equal(f.remoteRef('refs/heads/main'), f.clean);
 });
