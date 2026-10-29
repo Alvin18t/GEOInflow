@@ -33,7 +33,7 @@ jobs:
           CANDIDATE: ${{ github.event.pull_request.head.sha || github.sha }}
         run: node scripts/liekan-public-history.mjs "$CANDIDATE"
       - name: Exercise clean and contaminated history fixtures from the trusted base
-        run: node --test tests/liekan/public-history.test.mjs
+        run: node --test tests/liekan/public-history.test.mjs tests/liekan/pre-push.test.mjs
   report:
     name: Report public ancestry
     needs: verify
