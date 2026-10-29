@@ -83,15 +83,17 @@ it('keeps queued work silent and lets the user resume a paused read after timeou
   expect(analysisPendingStore.snapshot()).toBe('[]');
 });
 it('refuses external task result URLs and never treats failure as a result', async () => {
-  const fetchJob = vi.fn();
+  const fetchJob = vi.fn(),
+    releaseJob = vi.fn(async () => Response.json({ released: true }));
   const pending = followAnalysisJob(
     { analysisJob: { ...job, resultUrl: 'https://evil.invalid/steal' } },
-    { fetchJob },
+    { fetchJob, releaseJob },
   );
   const assertion = expect(pending).rejects.toThrow('Invalid analytics task path');
   await vi.advanceTimersByTimeAsync(3000);
   await assertion;
   expect(fetchJob).not.toHaveBeenCalled();
+  expect(releaseJob).not.toHaveBeenCalled();
 });
 it('opts in only compatible aggregate routes', () => {
   expect(

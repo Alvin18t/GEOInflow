@@ -3590,6 +3590,14 @@ export const operations = {
     queryParams: [],
     hasBody: true,
   },
+  releaseLiekanAnalysisViewer: {
+    operationId: 'releaseLiekanAnalysisViewer',
+    method: 'delete',
+    path: '/api/liekan/websites/{websiteId}/analytics-jobs/{jobId}',
+    pathParams: ['websiteId', 'jobId'],
+    queryParams: [],
+    hasBody: false,
+  },
   resetWebsite: {
     operationId: 'resetWebsite',
     method: 'post',
@@ -6232,6 +6240,17 @@ export abstract class GeneratedUmamiClient {
     options?: RequestOptions,
   ): Promise<OperationOutput<'record'>> {
     return this.execute('record', input, options);
+  }
+
+  /**
+   * Release this private browser read without cancelling other viewers
+   * `DELETE /api/liekan/websites/{websiteId}/analytics-jobs/{jobId}`
+   */
+  releaseLiekanAnalysisViewer(
+    input: OperationInput<'releaseLiekanAnalysisViewer'>,
+    options?: RequestOptions,
+  ): Promise<OperationOutput<'releaseLiekanAnalysisViewer'>> {
+    return this.execute('releaseLiekanAnalysisViewer', input, options);
   }
 
   /**

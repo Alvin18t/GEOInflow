@@ -8,6 +8,7 @@ const m = vi.hoisted(() => ({
   peek: vi.fn(),
   fast: vi.fn(),
   dispatch: vi.fn(),
+  process: vi.fn(),
   queue: vi.fn(),
   refreshJob: vi.fn(),
 }));
@@ -16,6 +17,7 @@ vi.mock('./server', () => ({ authorize: m.authorize }));
 vi.mock('../log-ingestion/queue', () => ({ getQueue: m.queue }));
 vi.mock('./analysis-queries', () => ({
   dispatchAnalysisQuery: m.dispatch,
+  processAnalysisQuery: m.process,
   requestAnalysisQuery: m.request,
   readAnalysisQuery: m.read,
 }));
@@ -25,6 +27,7 @@ vi.mock('./dashboard-snapshots', () => ({
 }));
 vi.mock('./page-report', () => ({ peekPageReport: m.peek }));
 vi.mock('./analysis-fast-read', () => ({ tryFastAnalysis: m.fast }));
+import * as viewers from './analysis-viewers';
 import {
   asyncAnalysisResponse,
   analysisJobResponse,
@@ -113,6 +116,41 @@ it('hands off a committed warm refresh while returning the published HTTP DTO', 
   expect(await response.json()).toEqual(value);
   expect(JSON.stringify([...response.headers])).not.toContain(id);
 });
+it.each([false, true])(
+  'retains only a warm opaque refresh lease and preserves its response on retention failure: %s',
+  async fails => {
+    const viewer = '33333333-3333-4333-8333-333333333333';
+    const retain = vi
+      .spyOn(viewers, 'retainPublishedAnalysisViewer')
+      .mockImplementation(async () => {
+        expect(viewers.currentAnalysisViewer()).toBe(viewer);
+        if (fails) throw new Error('synthetic metadata unavailable');
+        return true;
+      });
+    const r = request();
+    r.headers.set('X-Liekan-View', viewer);
+    m.request.mockResolvedValue({
+      ready: true,
+      value: { pageviews: 7 },
+      generatedAt: 1,
+      expiresAt: 2,
+    });
+    m.refreshJob.mockReturnValue(id);
+    try {
+      const response = await asyncAnalysisResponse(r, site, 'feature:page-report');
+      expect(response.status).toBe(200);
+      expect(await response.json()).toEqual({ pageviews: 7 });
+      expect(retain).toHaveBeenCalledWith(site, 'actor', id);
+      retain.mockClear();
+      m.refreshJob.mockReturnValue(undefined);
+      await asyncAnalysisResponse(r, site, 'feature:page-report');
+      expect(retain).not.toHaveBeenCalled();
+    } finally {
+      retain.mockRestore();
+    }
+  },
+);
+
 it('keeps a warm published response available when early handoff fails', async () => {
   m.request.mockResolvedValue({
     ready: true,
@@ -228,3 +266,32 @@ it.each([false, true])(
     }
   },
 );
+
+it('returns a newly published foreground report through the existing job result projection', async () => {
+  const r = request();
+  r.headers.set('X-Liekan-View', '33333333-3333-4333-8333-333333333333');
+  m.process.mockResolvedValue({ acquired: true, value: undefined });
+  m.read.mockResolvedValue({ ready: true, value: { pageviews: 7 }, generatedAt: 1, expiresAt: 2 });
+  const response = await asyncAnalysisResponse(r, site, 'feature:page-report');
+  expect(response.status).toBe(200);
+  expect(await response.json()).toEqual({ pageviews: 7 });
+  expect(response.headers.get('X-Liekan-Read-Path')).toBe('foreground');
+  expect(m.process).toHaveBeenCalledWith(id, { firstPage: true });
+  expect(m.dispatch).not.toHaveBeenCalled();
+});
+it('hands off the same task when a bounded foreground read defers', async () => {
+  const r = request();
+  r.headers.set('X-Liekan-View', '33333333-3333-4333-8333-333333333333');
+  m.process.mockResolvedValue({ acquired: true, value: new Error('defer') });
+  expect((await asyncAnalysisResponse(r, site, 'feature:page-report')).status).toBe(202);
+  expect(m.dispatch).toHaveBeenCalledWith(id, undefined);
+  expect(m.read).not.toHaveBeenCalled();
+});
+it('rejects an invalid viewer identifier before registering any task', async () => {
+  const r = request();
+  r.headers.set('X-Liekan-View', 'invalid');
+  await expect(asyncAnalysisResponse(r, site, 'feature:page-report')).rejects.toMatchObject({
+    status: 400,
+  });
+  expect(m.request).not.toHaveBeenCalled();
+});

@@ -13,6 +13,7 @@ import {
   analysisTransaction,
   findAnalysisVersions,
   analysisLogRawFactsSql,
+  analysisLogRawRowsSql,
   analysisVisitRowsSql,
 } from './analysis-rollups-db';
 import { browserPopulationMetadataSql, populationFromRow } from './browser-population';
@@ -74,7 +75,11 @@ const visitFilterKeys = new Set([
 ]);
 async function readTransaction<T>(work: (tx: AnalysisTx) => Promise<T>) {
   const snapshot = getQuerySnapshot();
-  return snapshot ? work(snapshot as AnalysisTx) : analysisTransaction(work, 'RepeatableRead');
+  const read = async (tx: AnalysisTx) => {
+    await tx.$executeRawUnsafe('SET LOCAL jit=off');
+    return work(tx);
+  };
+  return snapshot ? read(snapshot as AnalysisTx) : analysisTransaction(read, 'RepeatableRead');
 }
 const fixedReadVersions = new WeakMap<
   object,
@@ -268,6 +273,7 @@ export async function readAnalysisLogRollup(
       const versions = await pinnedReadVersions(tx, input.websiteId);
       if (!versions || !(await hasCoveredManifest(tx, input, 'log', versions))) return null;
       const aggregates: Record<string, string> = {
+        classificationSet: `(SELECT coalesce(string_agg(DISTINCT classification_version,','),'legacy') FROM low)`,
         summary: `(SELECT jsonb_build_object('requests',coalesce(sum(requests),0)::text,'ai',coalesce(sum(requests) FILTER(WHERE ${ai}),0)::text,
           'pages',(SELECT count(DISTINCT path)::text FROM paths WHERE ${ai}),
           'abnormal',coalesce(sum(requests) FILTER(WHERE status>=400),0)::text,
@@ -300,7 +306,8 @@ export async function readAnalysisLogRollup(
           SELECT extract(hour FROM bucket AT TIME ZONE $4)::int AS hour,sum(requests)::text AS count FROM low WHERE ${ai} GROUP BY 1 ORDER BY 1
         ) t),'[]'::jsonb)`,
       };
-      const requested = input.fields || Object.keys(aggregates);
+      const requested =
+        input.fields || Object.keys(aggregates).filter(field => field !== 'classificationSet');
       if (requested.some(field => !Object.hasOwn(aggregates, field))) return null;
       const needsPaths = requested.some(field => ['summary', 'bots', 'pages'].includes(field));
       const projections = requested.map(field => `${aggregates[field]} AS "${field}"`);
@@ -452,6 +459,113 @@ function visitFactsSql(inclusiveEnd = true, geography = true, observed = false) 
  ), facts AS MATERIALIZED (
   SELECT * FROM observed_facts WHERE coalesce((dimensions->>'identityAvailable')::boolean,false)
  )`;
+}
+
+/** Read the crawler page's browser presence, date labels and identity evidence together. */
+export async function readAnalysisVisitContext(input: AnalysisVisitPopulationInput): Promise<{
+  totals: AnalysisVisitTotals;
+  population: BrowserPopulation;
+  dates: string[];
+} | null> {
+  if (
+    process.env.CLICKHOUSE_URL ||
+    !validWindow(input) ||
+    +input.endDate - +input.startDate > 1096 * 86400000
+  )
+    return null;
+  const timezone = input.timezone || 'UTC';
+  if (!timezoneSupported(timezone, input)) return null;
+  return readTransaction(async tx => {
+    // UTC hour facts can supply calendar labels only when the whole hour stays on one local day.
+    const [grid] = await tx.$queryRawUnsafe<{ aligned: boolean }[]>(
+      `SELECT NOT EXISTS(SELECT 1 FROM generate_series(
+        date_bin(interval '1 hour',$1::timestamptz,timestamptz '2000-01-01Z'),$2::timestamptz,interval '1 hour') hours(at)
+       WHERE mod(extract(epoch FROM ((at AT TIME ZONE $3)-(at AT TIME ZONE 'UTC'))),3600)<>0
+        OR (at AT TIME ZONE $3)::date<>((at+interval '1 hour'-interval '1 microsecond') AT TIME ZONE $3)::date) AS aligned`,
+      input.startDate,
+      input.endDate,
+      timezone,
+    );
+    if (!grid.aligned) return null;
+    const versions = await pinnedReadVersions(tx, input.websiteId);
+    if (!versions) return null;
+    const [row] = await tx.$queryRawUnsafe<any[]>(
+      `WITH ${coverageSql}, ${gapRangesSql('visit_gaps', 'covered', !input.halfOpen)},
+raw_window AS MATERIALIZED(
+ SELECT e.* FROM visit_gaps gap CROSS JOIN LATERAL(
+  SELECT e.session_id,e.visit_id,e.created_at,e.event_type,
+   qualified.event_id IS NOT NULL AND EXISTS(SELECT 1 FROM (TABLE session) present WHERE present.website_id=e.website_id AND present.session_id=e.session_id) AS identity_available,
+   env.identity_version,q.rule_version,q.catalog_version::text AS catalog_version
+  FROM liekan_observed_browser_event e
+  LEFT JOIN liekan_event_environment env ON env.website_id=e.website_id AND env.event_id=e.event_id
+  LEFT JOIN liekan_reporting_event_quality q ON q.website_id=e.website_id AND q.event_id=e.event_id
+  LEFT JOIN liekan_browser_identity qualified ON qualified.website_id=e.website_id AND qualified.event_id=e.event_id
+  WHERE e.website_id=$1::uuid AND e.created_at>=gap.starts AND e.created_at<gap.ends OFFSET 0
+ ) e
+), raw_context AS MATERIALIZED(
+ SELECT session_id,visit_id,to_char(created_at AT TIME ZONE $4,'YYYY-MM-DD') AS day,identity_available,identity_version,rule_version,catalog_version,
+  count(*) AS eligible_events,count(*) FILTER(WHERE event_type NOT IN(2,5)) AS pageviews,bool_or(event_type=2) AS has_custom,
+  min(created_at) FILTER(WHERE event_type NOT IN(2,5)) AS min_time,max(created_at) FILTER(WHERE event_type NOT IN(2,5)) AS max_time
+ FROM raw_window GROUP BY 1,2,3,4,5,6,7
+), context_facts AS MATERIALIZED(
+ SELECT f.session_id,f.visit_id,to_char(f.bucket AT TIME ZONE $4,'YYYY-MM-DD') AS day,
+  coalesce((f.dimensions->>'identityAvailable')::boolean,false) AS identity_available,
+  f.dimensions->>'identityVersion' AS identity_version,f.dimensions->>'ruleVersion' AS rule_version,f.dimensions->>'catalogVersion' AS catalog_version,
+  f.eligible_events,f.pageviews,f.has_custom,f.min_time,f.max_time
+ FROM liekan_analysis_visit f JOIN covered c ON c.generation=f.generation AND c.website_id=f.website_id
+ WHERE f.bucket>=date_bin(interval '1 hour',$2::timestamptz,timestamptz '2000-01-01Z') AND f.bucket<$3::timestamptz
+ UNION ALL SELECT * FROM raw_context
+), context_visits AS MATERIALIZED(
+ SELECT session_id,visit_id,sum(pageviews) AS pageviews,bool_or(has_custom) AS has_custom,min(min_time) AS min_time,max(max_time) AS max_time
+ FROM context_facts WHERE identity_available GROUP BY session_id,visit_id HAVING sum(pageviews)>0
+) SELECT ${browserPopulationMetadataSql},'qualified-browser' AS "metricScope",
+ coalesce(sum(eligible_events),0)::text AS "eligibleEvents",
+ coalesce(sum(eligible_events) FILTER(WHERE identity_available),0)::text AS "qualifiedEvents",
+ coalesce(sum(pageviews),0)::text AS "eligiblePV",
+ coalesce(sum(pageviews) FILTER(WHERE identity_available),0)::text AS "qualifiedPV",
+ count(DISTINCT session_id) FILTER(WHERE pageviews>0 AND identity_available)::text AS "qualifiedVisitors",
+ ARRAY(SELECT DISTINCT identity_version FROM context_facts WHERE identity_version IS NOT NULL ORDER BY 1 LIMIT 33) AS "identityVersions",
+ ARRAY(SELECT DISTINCT identity_version FROM context_facts WHERE identity_version IS NOT NULL AND pageviews>0 AND identity_available ORDER BY 1 LIMIT 33) AS "qualifiedIdentityVersions",
+ ARRAY(SELECT DISTINCT rule_version FROM context_facts WHERE rule_version IS NOT NULL ORDER BY 1 LIMIT 33) AS "ruleVersions",
+ ARRAY(SELECT DISTINCT catalog_version FROM context_facts WHERE catalog_version IS NOT NULL ORDER BY 1 LIMIT 33) AS "catalogVersions",
+ ARRAY(SELECT DISTINCT day FROM context_facts WHERE pageviews>0 AND identity_available ORDER BY 1) AS dates,
+ (SELECT jsonb_build_object('pageviews',coalesce(sum(pageviews),0)::text,'visitors',count(DISTINCT session_id)::text,'visits',count(DISTINCT visit_id)::text,
+  'bounces',count(*) FILTER(WHERE pageviews=1 AND NOT has_custom)::text,'totaltime',coalesce(sum(floor(extract(epoch FROM(max_time-min_time)))),0)::bigint::text) FROM context_visits) AS totals
+ FROM context_facts`,
+      input.websiteId,
+      input.startDate,
+      input.endDate,
+      timezone,
+      'visit',
+      JSON.stringify(versions),
+    );
+    for (const key of [
+      'eligibleEvents',
+      'qualifiedEvents',
+      'eligiblePV',
+      'qualifiedPV',
+      'qualifiedVisitors',
+    ])
+      analysisSafeNumber(row[key]);
+    return {
+      totals: Object.fromEntries(
+        Object.entries(row.totals).map(([key, value]) => [
+          key,
+          analysisSafeNumber(value as string),
+        ]),
+      ) as unknown as AnalysisVisitTotals,
+      population: {
+        ...populationFromRow(row, {
+          startAt: +input.startDate,
+          endAt: +input.endDate,
+          timezone,
+          ...(input.halfOpen ? { endExclusive: true } : {}),
+        }),
+        resourceId: input.websiteId,
+      },
+      dates: row.dates,
+    };
+  });
 }
 
 /** Exact full-window identity evidence is independent of metric filters and PV-only grouping. */
@@ -650,15 +764,19 @@ export async function readAnalysisLogSeries(
         { day: string; bot: string; type: string; count: string; aiRequests: string }[]
       >(
         `WITH ${coverageSql}, ${gapRangesSql('series_gaps', 'covered', !modern)},
-        ${analysisLogRawFactsSql('series_gaps')}, raw_scope AS MATERIALIZED (
-          SELECT created_at,dimensions FROM reporting_facts
-        ), low_facts AS (
-          SELECT f.bucket,f.dimensions,f.requests FROM liekan_analysis_log f JOIN covered c ON c.generation=f.generation AND c.website_id=f.website_id WHERE ${derivedBucketBounds} AND f.grain=${lowGrainSql}
-          UNION ALL SELECT date_bin(interval '5 minutes',created_at,timestamptz '2000-01-01Z'),dimensions,count(*) FROM raw_scope GROUP BY 1,2
-        ), low AS (SELECT bucket,requests,${flattened} FROM low_facts)
-        SELECT to_char(bucket AT TIME ZONE $4,'${format}') AS day,bot,bot_type AS type,sum(requests)::text AS count,
+        ${analysisLogRawRowsSql('series_gaps')}, series_facts AS (
+          SELECT to_char(f.bucket AT TIME ZONE $4,'${format}') AS day,f.dimensions->>'bot' AS bot,f.dimensions->>'type' AS bot_type,
+           f.requests,(f.dimensions->>'aiEligible')::boolean AS ai_eligible,f.dimensions->>'recognitionState' AS recognition_state,
+           f.dimensions->>'verification' AS verification,(f.dimensions->>'selfCheck')::boolean AS self_check
+          FROM liekan_analysis_log f JOIN covered c ON c.generation=f.generation AND c.website_id=f.website_id
+          WHERE ${derivedBucketBounds} AND f.grain=${lowGrainSql}
+          UNION ALL
+          SELECT to_char(date_bin(interval '5 minutes',created_at,timestamptz '2000-01-01Z') AT TIME ZONE $4,'${format}'),bot,bot_type,1::bigint,ai_eligible,recognition_state,verification,
+           user_agent LIKE 'Liekan-Crawler-Check/%' FROM reporting_raw
+        )
+        SELECT day,bot,bot_type AS type,sum(requests)::text AS count,
           coalesce(sum(requests) FILTER(WHERE ${ai}),0)::text AS "aiRequests"
-        FROM low CROSS JOIN (SELECT $7::boolean) parameter_types
+        FROM series_facts CROSS JOIN (SELECT $7::boolean) parameter_types
         WHERE ${modern ? 'NOT self_check AND' : ''} ${identity}
         GROUP BY 1,2,3 ORDER BY 1,2,3`,
         input.websiteId,

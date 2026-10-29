@@ -11,8 +11,15 @@ const args = process.argv.slice(2);
 if (args[0] === '--') args.shift();
 const benchmark = args.includes('--benchmark');
 const captureBenchmark = args.includes('--capture-benchmark');
-const dashboardBenchmark = args.includes('--dashboard-benchmark');
+const firstLoadBenchmark = args.includes('--first-load-benchmark');
+const dashboardBenchmark = args.includes('--dashboard-benchmark') || firstLoadBenchmark;
+let logRows = 9000000,
+  browserRows = 9000;
+const retainFixture = args.includes('--retain-fixture');
+if (retainFixture && !firstLoadBenchmark)
+  throw new Error('Retention requires --first-load-benchmark');
 const scopeC = args.includes('--scope-c');
+const scopeReads = args.includes('--scope-reads');
 if ([benchmark, captureBenchmark, dashboardBenchmark].filter(Boolean).length > 1)
   throw new Error('Select one benchmark mode');
 let rows = 1000000,
@@ -21,11 +28,41 @@ let rows = 1000000,
   distribution;
 for (let index = 0; index < args.length; index++) {
   if (
-    ['--benchmark', '--capture-benchmark', '--dashboard-benchmark', '--scope-c'].includes(
-      args[index],
-    )
+    [
+      '--benchmark',
+      '--capture-benchmark',
+      '--dashboard-benchmark',
+      '--first-load-benchmark',
+      '--retain-fixture',
+      '--scope-c',
+      '--scope-reads',
+    ].includes(args[index])
   )
     continue;
+  if (args[index] === '--browser-rows' && args[index + 1]) {
+    browserRows = Number(args[++index]);
+    if (
+      !firstLoadBenchmark ||
+      !Number.isInteger(browserRows) ||
+      browserRows < 900 ||
+      browserRows > 90000 ||
+      browserRows % 30
+    )
+      throw new Error('Browser auxiliary rows require a multiple of 30 from 900 to 90000');
+    continue;
+  }
+  if (args[index] === '--log-rows' && args[index + 1]) {
+    logRows = Number(args[++index]);
+    if (
+      !firstLoadBenchmark ||
+      !Number.isInteger(logRows) ||
+      logRows < 30000 ||
+      logRows > 15000000 ||
+      logRows % 30
+    )
+      throw new Error('First-load log rows require a multiple of 30 from 30000 to 15000000');
+    continue;
+  }
   if (args[index] === '--baseline-image' && args[index + 1]) {
     baselineImage = args[++index];
     continue;
@@ -43,7 +80,7 @@ for (let index = 0; index < args.length; index++) {
     continue;
   }
   throw new Error(
-    'Usage: node tests/liekan/analysis-rollups.integration.mjs [--scope-c|--benchmark|--capture-benchmark|--dashboard-benchmark --rows 10000|1000000|10000000] [--candidate-image image] [--baseline-image image] [--distribution uniform|hotspot80]',
+    'Usage: node tests/liekan/analysis-rollups.integration.mjs [--scope-c|--scope-reads|--benchmark|--capture-benchmark|--dashboard-benchmark --rows 10000|1000000|10000000|--first-load-benchmark --log-rows 30000|9000000 --browser-rows 900|9000|90000 --retain-fixture] [--candidate-image image] [--baseline-image image] [--distribution uniform|hotspot80]',
   );
 }
 if (
@@ -51,13 +88,16 @@ if (
   ![10000, 1000000, 10000000].includes(rows)
 )
   throw new Error('Benchmark rows must be 10000 (smoke), 1000000, or 10000000');
-if (scopeC && (benchmark || captureBenchmark || dashboardBenchmark || baselineImage))
+if (
+  (scopeC || scopeReads) &&
+  (benchmark || captureBenchmark || dashboardBenchmark || baselineImage)
+)
   throw new Error('--scope-c is a focused correctness run');
 if (baselineImage && !dashboardBenchmark)
   throw new Error('--baseline-image requires --dashboard-benchmark');
 if (distribution && (!dashboardBenchmark || !['uniform', 'hotspot80'].includes(distribution)))
   throw new Error('--distribution requires --dashboard-benchmark and uniform or hotspot80');
-if (dashboardBenchmark && rows !== 10000 && !distribution)
+if (dashboardBenchmark && !firstLoadBenchmark && rows !== 10000 && !distribution)
   throw new Error(
     'Scale dashboard benchmarks require --distribution so each 1M/10M distribution owns a fresh database',
   );
@@ -103,6 +143,11 @@ if (benchmark || captureBenchmark || dashboardBenchmark) {
   if (benchmark) env.LIEKAN_ANALYSIS_ROLLUPS_BENCHMARK = '1';
   if (captureBenchmark) env.LIEKAN_ANALYSIS_CAPTURE_BENCHMARK = '1';
   if (dashboardBenchmark) env.LIEKAN_ANALYSIS_DASHBOARD_BENCHMARK = '1';
+  if (firstLoadBenchmark) {
+    env.LIEKAN_ANALYSIS_FIRST_LOAD_BENCHMARK = '1';
+    env.LIEKAN_ANALYSIS_FIRST_LOAD_LOG_ROWS = String(logRows);
+    env.LIEKAN_ANALYSIS_FIRST_LOAD_BROWSER_ROWS = String(browserRows);
+  }
   if (distribution) env.LIEKAN_ANALYSIS_DASHBOARD_DISTRIBUTION = distribution;
   env.LIEKAN_ANALYSIS_ROLLUPS_BENCHMARK_ROWS = String(rows);
 }
@@ -281,7 +326,7 @@ try {
   await run('pnpm', ['exec', 'prisma', 'migrate', 'deploy']);
   await run('node', ['scripts/liekan-migrate.mjs']);
   await run('node', ['scripts/liekan-migrate.mjs']);
-  if (!benchmark && !captureBenchmark && !dashboardBenchmark && !scopeC) {
+  if (!benchmark && !captureBenchmark && !dashboardBenchmark && !scopeC && !scopeReads) {
     await verifyAnalysisUpgradeHistories({ run, env, folder });
     const browser = await run(
       'pnpm',
@@ -371,33 +416,41 @@ try {
       throw new Error('Capture worker ownership changed before preflight cleanup');
     await run('docker', ['rm', '--volumes', workerName]);
   }
-  const files = dashboardBenchmark
-    ? ['src/lib/liekan/upstream/analysis-dashboard.benchmark.test.ts']
-    : captureBenchmark
-      ? ['src/lib/liekan/upstream/analysis-capture.benchmark.test.ts']
-      : benchmark
-        ? ['src/lib/liekan/upstream/analysis-rollups.benchmark.test.ts']
-        : scopeC
-          ? [
-              'src/lib/liekan/upstream/analysis-rollups.integration.test.ts',
-              'src/lib/liekan/upstream/analysis-queries.integration.test.ts',
-              'src/lib/liekan/upstream/dashboard-snapshots.integration.test.ts',
-              'src/lib/liekan/upstream/dashboard-scheduling.integration.test.ts',
-              'src/lib/liekan/upstream/bounded-browser-events.integration.test.ts',
-              'src/lib/liekan/upstream/visit-build-paging.integration.test.ts',
-            ]
-          : [
-              'src/lib/liekan/upstream/analysis-ingestion.integration.test.ts',
-              'src/lib/liekan/upstream/analysis-revenue.integration.test.ts',
-              'src/lib/liekan/upstream/analysis-population.integration.test.ts',
-              'src/lib/liekan/upstream/analysis-rollups.integration.test.ts',
-              'src/lib/liekan/upstream/analysis-queries.integration.test.ts',
-              'src/lib/liekan/upstream/dashboard-snapshots.integration.test.ts',
-              'src/lib/liekan/upstream/dashboard-scheduling.integration.test.ts',
-              'src/lib/liekan/upstream/bounded-browser-events.integration.test.ts',
-              'src/lib/liekan/upstream/browser-detail-facts.integration.test.ts',
-              'src/lib/liekan/upstream/visit-build-paging.integration.test.ts',
-            ];
+  const files = firstLoadBenchmark
+    ? ['src/lib/liekan/upstream/analysis-first-load.benchmark.test.ts']
+    : dashboardBenchmark
+      ? ['src/lib/liekan/upstream/analysis-dashboard.benchmark.test.ts']
+      : captureBenchmark
+        ? ['src/lib/liekan/upstream/analysis-capture.benchmark.test.ts']
+        : benchmark
+          ? ['src/lib/liekan/upstream/analysis-rollups.benchmark.test.ts']
+          : scopeReads
+            ? [
+                'src/lib/liekan/upstream/analysis-queries.integration.test.ts',
+                'src/lib/liekan/upstream/dashboard-snapshots.integration.test.ts',
+                'src/lib/liekan/upstream/dashboard-scheduling.integration.test.ts',
+              ]
+            : scopeC
+              ? [
+                  'src/lib/liekan/upstream/analysis-rollups.integration.test.ts',
+                  'src/lib/liekan/upstream/analysis-queries.integration.test.ts',
+                  'src/lib/liekan/upstream/dashboard-snapshots.integration.test.ts',
+                  'src/lib/liekan/upstream/dashboard-scheduling.integration.test.ts',
+                  'src/lib/liekan/upstream/bounded-browser-events.integration.test.ts',
+                  'src/lib/liekan/upstream/visit-build-paging.integration.test.ts',
+                ]
+              : [
+                  'src/lib/liekan/upstream/analysis-ingestion.integration.test.ts',
+                  'src/lib/liekan/upstream/analysis-revenue.integration.test.ts',
+                  'src/lib/liekan/upstream/analysis-population.integration.test.ts',
+                  'src/lib/liekan/upstream/analysis-rollups.integration.test.ts',
+                  'src/lib/liekan/upstream/analysis-queries.integration.test.ts',
+                  'src/lib/liekan/upstream/dashboard-snapshots.integration.test.ts',
+                  'src/lib/liekan/upstream/dashboard-scheduling.integration.test.ts',
+                  'src/lib/liekan/upstream/bounded-browser-events.integration.test.ts',
+                  'src/lib/liekan/upstream/browser-detail-facts.integration.test.ts',
+                  'src/lib/liekan/upstream/visit-build-paging.integration.test.ts',
+                ];
   await run(
     'pnpm',
     [
@@ -425,7 +478,8 @@ try {
   );
   console.log(`Evidence: ${folder}/vitest.json`);
   if (captureBenchmark) console.log(`Capture evidence: ${folder}/capture-benchmark.json`);
-  if (dashboardBenchmark) {
+  if (firstLoadBenchmark) console.log(`First-load evidence: ${folder}/first-load-benchmark.json`);
+  if (dashboardBenchmark && !firstLoadBenchmark) {
     const measurement = JSON.parse(await readFile(`${folder}/dashboard-benchmark.json`, 'utf8'));
     console.log(
       `Dashboard mechanical execution complete; candidate performance targets passed: ${measurement.candidateTargetsPassed === true}; overall evidence gate passed: ${measurement.passed === true}`,
@@ -462,7 +516,8 @@ try {
     ['inspect', '--format', `{{ index .Config.Labels "${label}" }}`, name],
     { optional: true, cleanup: true },
   );
-  if (owned.code === 0 && owned.output.trim() === runId)
-    await run('docker', ['rm', '--force', '--volumes', name], { cleanup: true });
-  else if (created) throw new Error('Isolated container ownership changed; cleanup stopped');
+  if (owned.code === 0 && owned.output.trim() === runId) {
+    if (retainFixture) console.log(`Owned database retained for rechecks: ${name}`);
+    else await run('docker', ['rm', '--force', '--volumes', name], { cleanup: true });
+  } else if (created) throw new Error('Isolated container ownership changed; cleanup stopped');
 }

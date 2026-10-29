@@ -1,6 +1,9 @@
 'use client';
 import { analysisAcceptedSchema, type AnalysisJob } from '../contracts/analysis-acceleration';
 
+const privateTaskPath =
+  /^\/liekan\/websites\/[a-f0-9-]{36}\/analytics-jobs\/[a-f0-9-]{36}(\/result)?$/i;
+
 type Pending = { job?: AnalysisJob; websiteId: string; paused: boolean; resume?: () => void };
 const pending = new Map<string, Pending>();
 const listeners = new Set<() => void>();
@@ -84,18 +87,24 @@ export async function waitForAnalysisVisibility(signal?: AbortSignal) {
 function foregroundBudget() {
   let elapsed = 0,
     last = performance.now(),
-    active = typeof document === 'undefined' || document.visibilityState !== 'hidden';
+    active = typeof document === 'undefined' || document.visibilityState !== 'hidden',
+    suspended = !active;
   const tick = () => {
     const now = performance.now();
     if (active) elapsed += now - last;
     last = now;
     active = typeof document === 'undefined' || document.visibilityState !== 'hidden';
+    suspended ||= !active;
   };
   document?.addEventListener('visibilitychange', tick);
   return {
     elapsed: () => {
       tick();
       return elapsed;
+    },
+    suspended: () => {
+      tick();
+      return suspended;
     },
     reset: () => {
       tick();
@@ -168,6 +177,7 @@ export async function followAnalysisJob(
     signal?: AbortSignal;
     fetchJob: (path: string) => Promise<Response>;
     onPrevious?: (value: unknown) => void;
+    releaseJob?: (path: string) => Promise<unknown>;
   },
 ): Promise<{ response: Response; data: any; startedAt: number }> {
   const accepted = analysisAcceptedSchema.parse(input);
@@ -179,10 +189,7 @@ export async function followAnalysisJob(
   if (accepted.previousResult !== undefined) options.onPrevious?.(accepted.previousResult);
   const read = async (path: string) => {
     // A server response can identify only the private job routes on the current origin.
-    if (
-      !/^\/liekan\/websites\/[a-f0-9-]{36}\/analytics-jobs\/[a-f0-9-]{36}(\/result)?$/i.test(path)
-    )
-      throw new Error('Invalid analytics task path');
+    if (!privateTaskPath.test(path)) throw new Error('Invalid analytics task path');
     const startedAt = performance.now();
     const response = await options.fetchJob(path),
       data = await response.json().catch(() => null);
@@ -225,9 +232,16 @@ export async function followAnalysisJob(
         if (result.response.status !== 202) return result;
       }
     }
+  } catch (error) {
+    if ((error as any)?.code === 'analysis-idle' && budget.suspended())
+      (error as any).visibilitySuspended = true;
+    throw error;
   } finally {
     budget.close();
     pending.delete(job.id);
     publish();
+    const releasePath = job.resultUrl.replace(/\/result$/, '');
+    if (options.releaseJob && privateTaskPath.test(releasePath))
+      void options.releaseJob(releasePath).catch(() => {});
   }
 }

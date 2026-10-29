@@ -64,11 +64,15 @@ beforeEach(() => {
     value: await work(() => true, { token: 'token', epoch: '1' }),
   }));
   m.query.mockImplementation(async (sql: string) => {
+    if (sql.startsWith('SELECT q.id FROM liekan_analysis_query q WHERE')) return [];
     // Another delivery may have requeued the row after this initial read.
     if (sql.startsWith('SELECT q.*')) return [{ ...row, next_attempt_at: new Date(2000) }];
     if (sql.startsWith('UPDATE liekan_analysis_query'))
       return [{ ...row, attempts: row.attempts + 1, started_at: new Date(10000) }];
     if (sql.startsWith('SELECT s.epoch')) return [{ epoch: 1n, mode: 'raw', siteNumber: 1 }];
+    if (sql.startsWith('SELECT 1 FROM liekan_analysis_background_lease WHERE'))
+      return [{ id: true }];
+    if (sql.startsWith('SELECT 1 FROM liekan_analysis_query q WHERE')) return [{ id }];
     if (sql.startsWith('SELECT id FROM')) return [{ id: true }];
     throw new Error('Unexpected mock query');
   });
@@ -153,11 +157,10 @@ it('still emits its attempt record when recording failure recovery also fails', 
 
 it('emits no compute attempt when admission is contended or a candidate was already claimed', async () => {
   m.permit.mockResolvedValue({ acquired: false });
-  m.query.mockResolvedValueOnce([{ ...row }]).mockResolvedValueOnce([{ id }]);
-  await processAnalysisQuery(id);
+  expect(await processAnalysisQuery(id)).toMatchObject({ acquired: false, retryDelivery: true });
   expect(log).not.toHaveBeenCalled();
   expect(m.compute).not.toHaveBeenCalled();
   m.query.mockResolvedValue([]);
-  await processAnalysisQuery(id);
+  expect(await processAnalysisQuery(id)).toMatchObject({ acquired: false, retryDelivery: false });
   expect(log).not.toHaveBeenCalled();
 });

@@ -617,28 +617,48 @@ export async function runOneAnalysisWorkUnit(
 
 /** A durable retained-history cursor waits for open hours and resumes failed deliveries. */
 export async function bootstrapAnalysisHistory(now = Date.now(), websiteId?: string) {
-  return analysisTransaction(async tx => {
-    const sites = await tx.$queryRawUnsafe<any[]>(
+  const sites = await analysisTransaction(tx =>
+    tx.$queryRawUnsafe<any[]>(
       `SELECT s.* FROM liekan_analysis_site s JOIN website w USING(website_id)
        WHERE w.deleted_at IS NULL AND s.mode='live' AND (s.archive_epoch IS DISTINCT FROM s.epoch OR NOT s.archive_complete)
        AND ($1::uuid IS NULL OR s.website_id=$1::uuid)
        ORDER BY s.archive_checked_at NULLS FIRST,s.website_id LIMIT 8 FOR UPDATE OF s SKIP LOCKED`,
       websiteId || null,
-    );
-    for (const site of sites) {
+    ),
+  );
+  let checked = 0;
+  for (const candidate of sites) {
+    // Discover source bounds before taking the authority row used by foreground admission.
+    const boundary =
+      String(candidate.archive_epoch) !== String(candidate.epoch)
+        ? (
+            await analysisTransaction(tx =>
+              tx.$queryRawUnsafe<{ starts: Date | null; ends: Date | null }[]>(
+                `SELECT min(at) AS starts,max(at) AS ends FROM (
+                 (SELECT created_at AS at FROM website_event WHERE website_id=$1::uuid ORDER BY created_at LIMIT 1)
+                 UNION ALL (SELECT created_at FROM website_event WHERE website_id=$1::uuid ORDER BY created_at DESC LIMIT 1)
+                 UNION ALL (SELECT created_at FROM liekan_log WHERE website_id=$1::uuid ORDER BY created_at LIMIT 1)
+                 UNION ALL (SELECT created_at FROM liekan_log WHERE website_id=$1::uuid ORDER BY created_at DESC LIMIT 1)) inputs`,
+                candidate.website_id,
+              ),
+            )
+          )[0]
+        : undefined;
+    checked += await analysisTransaction(async tx => {
+      const [site] = await tx.$queryRawUnsafe<any[]>(
+        `SELECT s.* FROM liekan_analysis_site s JOIN website w USING(website_id)
+         WHERE s.website_id=$1::uuid AND s.epoch=$2::bigint AND s.mode='live' AND w.deleted_at IS NULL
+         AND (s.archive_epoch IS DISTINCT FROM s.epoch OR NOT s.archive_complete)
+         FOR UPDATE OF s SKIP LOCKED`,
+        candidate.website_id,
+        String(candidate.epoch),
+      );
+      if (!site || (String(site.archive_epoch) !== String(site.epoch) && !boundary)) return 0;
       await tx.$executeRawUnsafe(
         'UPDATE liekan_analysis_site SET archive_checked_at=clock_timestamp() WHERE website_id=$1::uuid',
         site.website_id,
       );
       if (String(site.archive_epoch) !== String(site.epoch)) {
-        const [boundary] = await tx.$queryRawUnsafe<{ starts: Date | null; ends: Date | null }[]>(
-          `SELECT min(at) AS starts,max(at) AS ends FROM (
-           (SELECT created_at AS at FROM website_event WHERE website_id=$1::uuid ORDER BY created_at LIMIT 1)
-           UNION ALL (SELECT created_at FROM website_event WHERE website_id=$1::uuid ORDER BY created_at DESC LIMIT 1)
-           UNION ALL (SELECT created_at FROM liekan_log WHERE website_id=$1::uuid ORDER BY created_at LIMIT 1)
-           UNION ALL (SELECT created_at FROM liekan_log WHERE website_id=$1::uuid ORDER BY created_at DESC LIMIT 1)) inputs`,
-          site.website_id,
-        );
         site.archive_next = boundary.starts
           ? new Date(Math.floor(+boundary.starts / 3600000) * 3600000)
           : null;
@@ -654,7 +674,7 @@ export async function bootstrapAnalysisHistory(now = Date.now(), websiteId?: str
           !boundary.starts,
         );
       }
-      if (!site.archive_next || !site.archive_until) continue;
+      if (!site.archive_next || !site.archive_until) return 1;
       if (site.archive_build_id) {
         const [build] = await tx.$queryRawUnsafe<any[]>(
           'SELECT * FROM liekan_analysis_build WHERE id=$1::uuid',
@@ -669,7 +689,7 @@ export async function bootstrapAnalysisHistory(now = Date.now(), websiteId?: str
               `UPDATE liekan_analysis_build SET status='queued',attempts=0,next_attempt_at=clock_timestamp()+interval '5 minutes',error_code=NULL WHERE id=$1::uuid`,
               build.id,
             );
-          continue;
+          return 1;
         }
         if (build) site.archive_next = build.range_end;
         await tx.$executeRawUnsafe(
@@ -683,13 +703,13 @@ export async function bootstrapAnalysisHistory(now = Date.now(), websiteId?: str
           'UPDATE liekan_analysis_site SET archive_complete=true WHERE website_id=$1::uuid',
           site.website_id,
         );
-        continue;
+        return 1;
       }
       const closed = new Date(Math.floor((now - 60000) / 3600000) * 3600000);
       const end = new Date(
         Math.min(+site.archive_until, +closed, +site.archive_next + 24 * 3600000),
       );
-      if (+end <= +site.archive_next) continue;
+      if (+end <= +site.archive_next) return 1;
       const id = randomUUID();
       await tx.$executeRawUnsafe(
         `INSERT INTO liekan_analysis_build(id,website_id,epoch,range_start,range_end,timezone,locale,request_id,request_hash,status,work_total,automatic_history)
@@ -713,9 +733,10 @@ export async function bootstrapAnalysisHistory(now = Date.now(), websiteId?: str
         site.website_id,
         id,
       );
-    }
-    return sites.length;
-  });
+      return 1;
+    });
+  }
+  return checked;
 }
 
 export async function reconcileAnalysisRollups(): Promise<{ queued: number }> {
