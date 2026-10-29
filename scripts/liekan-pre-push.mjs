@@ -1,6 +1,5 @@
 import { spawnSync } from 'node:child_process';
-import { existsSync, readFileSync, realpathSync } from 'node:fs';
-import { fileURLToPath } from 'node:url';
+import { readFileSync } from 'node:fs';
 import { checkPublicHistory, git, readPolicy } from './liekan-public-history.mjs';
 
 export function gitConfig(repo, args) {
@@ -140,11 +139,10 @@ export function checkPush({
   return { checked: commits.length, github: true };
 }
 
-if (
-  process.argv[1] &&
-  existsSync(process.argv[1]) &&
-  realpathSync(process.argv[1]) === fileURLToPath(import.meta.url)
-) {
+if (typeof import.meta.main !== 'boolean')
+  throw new Error('Run the GEOInflow push guard with the Node.js version pinned in .nvmrc');
+
+if (import.meta.main) {
   try {
     if (process.argv[2] === '--help') {
       console.log(

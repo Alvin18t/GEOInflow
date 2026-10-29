@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import {
   chmodSync,
+  cpSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -13,6 +14,7 @@ import {
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
+import { pathToFileURL } from 'node:url';
 import { installPushGuard } from '../../scripts/liekan-install-push-guard.mjs';
 import { checkPush, isGitHubPush } from '../../scripts/liekan-pre-push.mjs';
 import { git } from '../../scripts/liekan-public-history.mjs';
@@ -353,6 +355,40 @@ test('managed hooks without executable permission cannot report successful insta
   const first = f.install();
   chmodSync(first.hook, 0o644);
   assert.throws(() => f.install(), /not executable/);
+});
+
+test('a snapshot upgrade during module loading cannot skip the installed guard', t => {
+  const f = fixture(t);
+  const installed = f.install();
+  const directory = join(f.repo, '.git/liekan-public-guard');
+  const next = 'f'.repeat(64);
+  cpSync(installed.snapshot, join(directory, next), { recursive: true });
+  const preload = join(f.root, 'switch-snapshot.mjs');
+  writeFileSync(
+    preload,
+    `
+    import { registerHooks } from 'node:module';
+    import { rmSync, symlinkSync } from 'node:fs';
+    registerHooks({ load(url, context, nextLoad) {
+      const result = nextLoad(url, context);
+      if (url.endsWith('/scripts/liekan-pre-push.mjs')) {
+        rmSync(${JSON.stringify(join(directory, 'current'))});
+        symlinkSync(${JSON.stringify(next)}, ${JSON.stringify(join(directory, 'current'))});
+        console.error('fixture-switched-snapshot');
+      }
+      return result;
+    }});
+  `,
+  );
+  const result = spawnSync(installed.hook, [github, github], {
+    cwd: f.repo,
+    env: { ...process.env, NODE_OPTIONS: `--import=${pathToFileURL(preload).href}` },
+    input: `refs/heads/feature/dirty ${f.dirty} refs/heads/feature/dirty ${zero}\n`,
+    encoding: 'utf8',
+  });
+  assert.match(result.stderr, /fixture-switched-snapshot/);
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /Unexpected public history root/);
 });
 
 test('effective Git SSH configuration and command precedence identify routed aliases', t => {
