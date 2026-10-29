@@ -101,6 +101,17 @@
       "removalCondition": "Remove when an upstream extension point provides this behavior and the registered regression checks pass"
     },
     {
+      "path": ".github/workflows/liekan-public-history.yml",
+      "purpose": "Enforce independent GEOInflow ancestry for public source publication",
+      "tests": [
+        "node --test tests/liekan/public-history.test.mjs tests/liekan/pre-push.test.mjs",
+        "node scripts/liekan-static-check.mjs"
+      ],
+      "owner": "Liekan release maintenance",
+      "constraint": "Use trusted base code to inspect candidate ancestry with read-only permissions and report the required status in a separate job",
+      "removalCondition": "Remove when an equivalent server-side public ancestry gate protects independent publication"
+    },
+    {
       "path": ".github/workflows/stale-issues.yml",
       "purpose": "Keep inherited automatic issue closure restricted to the upstream repository",
       "tests": [

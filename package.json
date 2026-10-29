@@ -73,6 +73,7 @@
     "liekan:upstream:prepare": "node scripts/liekan-upstream.mjs prepare",
     "liekan:check-public-history": "node scripts/liekan-public-history.mjs",
     "liekan:publish-public": "node scripts/liekan-publish-public.mjs",
+    "liekan:install-push-guard": "node scripts/liekan-install-push-guard.mjs",
     "liekan:verify": "node scripts/liekan-verify.mjs",
     "liekan:seed-demo": "node scripts/liekan-seed-demo.mjs",
     "liekan:crawlers:check-sources": "tsx scripts/liekan-crawlers-check-sources.ts",

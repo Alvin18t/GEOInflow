@@ -21,7 +21,20 @@ NODE
 
 开发仓库保留 Gitee 的完整提交历史，用于功能开发和上游升级。GitHub 公开仓库沿用独立的 GEOInflow 历史。两边同步同一版本的源码，各自维护提交编号。开发目录的 GitHub remote 仅用于读取；将其推送地址设置为 `disabled://geoinflow-use-public-checkout`，日常推送通过 Gitee 的 `origin` 完成。
 
-首次准备公共目录时，单独克隆 GitHub 仓库。公共目录只保留 GitHub `origin`，保持在干净的 `main` 分支。开发修改提交并验证后，在开发目录运行：
+首次准备公共目录时，单独克隆 GitHub 仓库。公共目录只保留 GitHub `origin`，保持在干净的 `main` 分支。
+
+首次使用或更新推送守卫后，在开发目录安装共享钩子，并为独立公共目录安装公共钩子：
+
+```sh
+pnpm liekan:install-push-guard
+pnpm liekan:install-push-guard --repo /path/to/GEOInflow-public
+```
+
+钩子保存在各仓库共享 Git 目录，链接工作目录自动继承。检查器、策略和运行路径以固定内容快照安装，旧分支无需拥有新脚本。安装器保留已有用户钩子和自定义 hooksPath，发现冲突时停止；重复安装相同版本保持不变。开发钩子拒绝向 GitHub 发布，公共钩子检查全部待推分支和注解标签的祖先，覆盖直接 URL、其他 remote 名称、URL 重写和 SSH Host 别名。它允许向 Gitee 推送完整开发历史。新克隆需要执行上述安装；主动跳过或禁用本地钩子会失去客户端检查，GitHub main 的服务端保护继续生效。
+
+安装前检查全部链接工作目录的 hooksPath，并确认已有受管钩子可执行。SSH 解析遵循 Git 的 `core.sshCommand` 和 `GIT_SSH_COMMAND` 配置，保留用户名、端口和配置文件；无法安全解释的 shell 命令或第三方 SSH 包装器会阻止推送，需先审查其路由配置。
+
+提交并验证开发修改后准备公共候选：
 
 ```sh
 pnpm liekan:publish-public --target /path/to/GEOInflow-public --branch feature/your-change --source-ref HEAD
@@ -38,7 +51,7 @@ GitHub 新增的独立贡献需要先同步回开发仓库。工具通过三方�
 GitHub `main` 启用分支保护：通过 PR 合并，必过检查为 `GEOInflow public history`，管理员同样受限，禁止强制推送和删除。PR 检查由 `pull_request_target` 的受信工作流执行，使用目标分支的检查器、策略和测试，只获取候选提交图；独立报告步骤将必过状态写到候选 head SHA，读取候选的步骤只有只读权限。公开仓库的常规 PR 无需导入开发祖先。历史污染回归测试使用独立临时仓库，覆盖干净提交、第二父节点带入上游、浅克隆、replace 遮蔽、完整导出、重复执行以及公共改动保护：
 
 ```sh
-node --test tests/liekan/public-history.test.mjs
+node --test tests/liekan/public-history.test.mjs tests/liekan/pre-push.test.mjs
 ```
 
 上游比较所需的浅层基线可以获取到本地对象库；它保持在公开分支祖先之外。处理上游升级时，在开发仓库完成合并和验收，再通过上述流程发布源码。保留 MIT 许可、原始版权、来源说明和完整示例数据包。
