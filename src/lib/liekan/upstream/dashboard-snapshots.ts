@@ -30,6 +30,13 @@ import {
 } from './dashboard-demand';
 
 type MaintenancePass = { coldRegistered: boolean };
+type AnalysisResponse = Awaited<ReturnType<typeof requestAnalysisQuery>>;
+type DashboardResponse =
+  | (Extract<AnalysisResponse, { ready: true }> & {
+      analysisJob?: undefined;
+      previousResult?: undefined;
+    })
+  | Extract<AnalysisResponse, { ready: false }>;
 const refreshJob = Symbol('dashboard-refresh-job');
 
 /** Only server-created projections can carry a committed producer to the HTTP handoff. */
@@ -302,7 +309,7 @@ export async function requestDashboardSnapshot(
   locale: 'zh-CN' | 'en-US' = 'zh-CN',
   foreground = true,
   maintenance?: MaintenancePass,
-) {
+): Promise<DashboardResponse> {
   let parameters = analysisQueryParameters(target, input);
   if (Buffer.byteLength(JSON.stringify(parameters)) > 16384)
     throw new LiekanError('统计条件超出上限', 413);
@@ -644,10 +651,12 @@ async function enqueue(
       // Admission, per-site capacity, result identity and the queued producer commit together.
       await lockSnapshotCapacity(tx, row.website_id);
       const [existing] = await tx.$queryRawUnsafe(
-        'SELECT 1 FROM liekan_dashboard_snapshot WHERE website_id=$1::uuid AND query_key=$2',
+        'SELECT result IS NOT NULL AS published,job_id FROM liekan_dashboard_snapshot WHERE website_id=$1::uuid AND query_key=$2',
         row.website_id,
         row.query_key,
       );
+      if (!retry && row.result == null && existing?.published && !existing.job_id)
+        throw new LiekanError('统计任务状态已更新，请重新读取', 409, 'analysis-state-changed');
       if (!existing) {
         const [count] = await tx.$queryRawUnsafe(
           'SELECT count(*)::int AS n FROM liekan_dashboard_snapshot WHERE website_id=$1::uuid',
@@ -730,7 +739,34 @@ async function enqueue(
         await publishDashboardSnapshot(tx, { ...job, generated_at: job.generated_at });
     },
     foreground,
-  );
+    { shareActive: !retry },
+  ).catch(async error => {
+    if (
+      !retry &&
+      !rechecked &&
+      row.result == null &&
+      ((error as any)?.code === 'analysis-state-changed' || (error as any)?.status === 429)
+    ) {
+      const [published] = await analysisTransaction(tx =>
+        tx.$queryRawUnsafe(
+          'SELECT 1 FROM liekan_dashboard_snapshot WHERE website_id=$1::uuid AND query_key=$2 AND result IS NOT NULL AND job_id IS NULL',
+          row.website_id,
+          row.query_key,
+        ),
+      );
+      if (published)
+        return requestDashboardSnapshot(
+          row.website_id,
+          actor,
+          row.target,
+          row.parameters,
+          row.locale,
+          foreground,
+          maintenance,
+        );
+    }
+    throw error;
+  });
   if (cold && !result.ready && maintenance) maintenance.coldRegistered = true;
   row.error_code = null;
   return result;

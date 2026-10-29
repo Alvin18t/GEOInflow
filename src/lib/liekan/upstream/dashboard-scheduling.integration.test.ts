@@ -28,10 +28,25 @@ import { DASHBOARD_INTERVAL, dashboardWarmRanges } from './dashboard-snapshot-mo
 import { currentCacheContext } from './cache-context';
 import { timedAnalyticsClient } from './analytics-deadline';
 import { coldDashboardPrewarmSql } from './dashboard-demand';
+import {
+  withAnalysisViewer,
+  releaseAnalysisViewer,
+  registerAnalysisViewer,
+  analysisJobDemandSql,
+} from './analysis-viewers';
+import { canReadFirstPage } from './analysis-page-admission';
 import { pageReportParts } from '../contracts/page-report';
 import { lockWritableWebsite } from './server';
 import { processAnalysisBuild, pumpAnalysisBuilds } from './analysis-build-queue';
 
+const withBlockedLane = (
+  kind: Parameters<typeof withAnalysisPermit>[0],
+  work: () => Promise<unknown>,
+) =>
+  withAnalysisPermit(kind, async () => {
+    if (kind === 'dashboard') await withAnalysisPermit(kind, work);
+    else await work();
+  });
 const enabled = process.env.LIEKAN_ANALYSIS_ROLLUPS_TEST === '1';
 const actors = [0, 1].map(() => ({ id: randomUUID(), role: 'user' }));
 const sites: string[] = [];
@@ -42,6 +57,7 @@ const sql = (text: string, ...values: unknown[]) =>
   analysisTransaction(tx => tx.$executeRawUnsafe(text, ...values));
 const parameters = (resource = 'overview') => ({
   ...dashboardWarmRanges('Asia/Shanghai')[0],
+  ...(resource.startsWith('ai/') ? { crawlerMetricsVersion: 1 } : {}),
   resource,
   chartPeriod: 'today',
   timezone: 'Asia/Shanghai',
@@ -164,6 +180,7 @@ describe.skipIf(!enabled)('ordinary dashboard demand scheduling in owned Postgre
       'UPDATE liekan_analysis_background_lease SET token=NULL,lease_until=NULL,incremental_waiting_at=NULL,history_waiting_at=NULL,interactive_turns=0 WHERE id',
     );
     await sql('UPDATE liekan_analysis_dashboard_lease SET token=NULL,lease_until=NULL WHERE id');
+    await sql('UPDATE liekan_analysis_read_lease SET token=NULL,lease_until=NULL');
     const execution = await import('./analysis-query-execution');
     vi.spyOn(execution, 'executeAnalysisQuery').mockResolvedValue({ pageviews: 1 });
   });
@@ -171,6 +188,440 @@ describe.skipIf(!enabled)('ordinary dashboard demand scheduling in owned Postgre
   afterAll(async () => {
     for (const id of sites) await sql('DELETE FROM website WHERE website_id=$1::uuid', id);
     for (const actor of actors) await sql('DELETE FROM "user" WHERE user_id=$1::uuid', actor.id);
+  });
+  it('keeps an opaque HTTP 200 refresh alive for its bounded dashboard demand window', async () => {
+    const first = await read(true, site, 'ai/pages');
+    if (first.ready) throw new Error('expected cold publication');
+    await finish(first.analysisJob.id);
+    await sql(
+      "UPDATE liekan_analysis_query SET queued_at=clock_timestamp()-interval '10 seconds' WHERE id=$1::uuid",
+      first.analysisJob.id,
+    );
+    await sql(
+      'UPDATE liekan_dashboard_snapshot SET fingerprint=NULL,data_through=to_timestamp(0) WHERE website_id=$1::uuid',
+      site,
+    );
+    const maintenance = await import('./crawler-maintenance'),
+      server = await import('./server'),
+      queue = await import('../log-ingestion/queue');
+    vi.spyOn(maintenance, 'authenticateCrawlerMaintenance').mockResolvedValue(actors[0]);
+    vi.spyOn(server, 'authorize').mockResolvedValue({
+      website: { id: site },
+      canManage: true,
+    } as any);
+    const boss = {
+      send: vi.fn(async () => randomUUID()),
+      update: vi.fn(async () => ({ jobs: [], updated: 0 })),
+    };
+    vi.spyOn(queue, 'getQueue').mockResolvedValue(boss as any);
+    const { asyncAnalysisResponse } = await import('./analysis-query-api');
+    const viewer = randomUUID();
+    await withBlockedLane('dashboard', async () => {
+      const response = await withPublishedRegistry(() =>
+        asyncAnalysisResponse(
+          new Request(
+            `http://fixture.invalid/api/liekan/websites/${site}/page-report?${new URLSearchParams(Object.entries(parameters('ai/pages')).map(([key, value]) => [key, String(value)]))}`,
+            { headers: { Prefer: 'respond-async', 'X-Liekan-View': viewer } },
+          ),
+          site,
+          'feature:page-report',
+        ),
+      );
+      expect(response.status).toBe(200);
+      expect((await response.json()).pageviews).toBe(1);
+      const [refresh] = await q(
+        "SELECT id FROM liekan_analysis_query WHERE website_id=$1::uuid AND status='queued'",
+        site,
+      );
+      expect(refresh).toBeDefined();
+      await sql(
+        "UPDATE liekan_analysis_query_viewer SET lease_until=lease_until-interval '20 seconds' WHERE job_id=$1::uuid AND viewer_id=$2::uuid",
+        refresh.id,
+        viewer,
+      );
+      await pumpAnalysisQueries(boss);
+      expect(
+        (
+          await q(
+            'SELECT status,error_code FROM liekan_analysis_query WHERE id=$1::uuid',
+            refresh.id,
+          )
+        )[0],
+      ).toEqual({ status: 'queued', error_code: null });
+      const [lease] = await q(
+        'SELECT c.managed,v.lease_until>clock_timestamp() AS active FROM liekan_analysis_query_consumer c JOIN liekan_analysis_query_viewer v USING(job_id,actor_id) WHERE c.job_id=$1::uuid AND v.viewer_id=$2::uuid',
+        refresh.id,
+        viewer,
+      );
+      expect(lease).toEqual({ managed: true, active: true });
+      await sql(
+        "UPDATE liekan_analysis_query_viewer SET lease_until=clock_timestamp()-interval '1 second' WHERE job_id=$1::uuid",
+        refresh.id,
+      );
+      await pumpAnalysisQueries(boss);
+      expect(
+        (
+          await q(
+            'SELECT status,error_code FROM liekan_analysis_query WHERE id=$1::uuid',
+            refresh.id,
+          )
+        )[0],
+      ).toEqual({ status: 'failed', error_code: 'analysis-idle' });
+    });
+  });
+  it('shares a producer while each tab owns a separately releasable viewer lease', async () => {
+    const firstView = randomUUID(),
+      secondView = randomUUID();
+    const first = await withAnalysisViewer(firstView, () => read());
+    const second = await withAnalysisViewer(secondView, () => read());
+    if (first.ready || second.ready) throw new Error('expected cold producer');
+    expect(first.analysisJob.id).toBe(second.analysisJob.id);
+    await withAnalysisViewer(firstView, () =>
+      releaseAnalysisViewer(site, actors[0], first.analysisJob.id),
+    );
+    expect(
+      (
+        await q('SELECT status FROM liekan_analysis_query WHERE id=$1::uuid', first.analysisJob.id)
+      )[0].status,
+    ).toBe('queued');
+    await withAnalysisViewer(secondView, () =>
+      withPublishedRegistry(() => readAnalysisQuery(site, actors[0], first.analysisJob.id)),
+    );
+    await expect(
+      withAnalysisViewer(firstView, () =>
+        withPublishedRegistry(() => readAnalysisQuery(site, actors[0], first.analysisJob.id)),
+      ),
+    ).rejects.toMatchObject({ code: 'analysis-idle' });
+    await withAnalysisViewer(secondView, () =>
+      releaseAnalysisViewer(site, actors[0], first.analysisJob.id),
+    );
+    expect(
+      (
+        await q(
+          'SELECT status,error_code FROM liekan_analysis_query WHERE id=$1::uuid',
+          first.analysisJob.id,
+        )
+      )[0],
+    ).toEqual({ status: 'failed', error_code: 'analysis-idle' });
+    expect((await withAnalysisViewer(randomUUID(), () => read())).ready).toBe(false);
+  });
+  it.each(['release', 'pump'] as const)(
+    'preserves a concurrent joining viewer during %s and reproduces the old snapshot race',
+    async method => {
+      for (const legacy of [true, false]) {
+        const view = randomUUID(),
+          joiningView = randomUUID();
+        const task = await withAnalysisViewer(view, () =>
+          read(true, site, legacy ? 'overview' : 'ai/pages'),
+        );
+        if (task.ready) throw new Error('expected cold producer');
+        const id = task.analysisJob.id;
+        if (method === 'pump')
+          await sql(
+            "UPDATE liekan_analysis_query_viewer SET lease_until=clock_timestamp()-interval '1 second' WHERE job_id=$1::uuid",
+            id,
+          );
+        let joined!: () => void, resume!: () => void;
+        const entered = new Promise<void>(resolve => (joined = resolve)),
+          gate = new Promise<void>(resolve => (resume = resolve));
+        const joining = analysisTransaction(tx =>
+          withAnalysisViewer(joiningView, async () => {
+            await registerAnalysisViewer(tx, id, actors[0].id);
+            if (legacy)
+              await tx.$queryRawUnsafe(
+                'SELECT id FROM liekan_analysis_query WHERE id=$1::uuid FOR SHARE',
+                id,
+              );
+            joined();
+            await gate;
+          }),
+        );
+        await entered;
+        let settled = false,
+          blocked = false;
+        const cancellation = (
+          legacy
+            ? analysisTransaction(async tx => {
+                // Execute the previous cancellation statement to establish a real Read Committed regression oracle.
+                if (method === 'release')
+                  await tx.$executeRawUnsafe(
+                    'UPDATE liekan_analysis_query_viewer SET lease_until=clock_timestamp() WHERE job_id=$1::uuid AND viewer_id=$2::uuid',
+                    id,
+                    view,
+                  );
+                await tx.$executeRawUnsafe(
+                  `UPDATE liekan_analysis_query q SET status='failed',error_code='analysis-idle'
+          WHERE q.id=$1::uuid AND q.status='queued' AND NOT ${analysisJobDemandSql()}`,
+                  id,
+                );
+              })
+            : method === 'release'
+              ? withAnalysisViewer(view, () => releaseAnalysisViewer(site, actors[0], id))
+              : pumpAnalysisQueries({ send: vi.fn(), update: vi.fn() })
+        ).finally(() => (settled = true));
+        try {
+          for (let i = 0; i < 100 && !settled; i++) {
+            const [activity] = await q(
+              "SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE datname=current_database() AND wait_event_type='Lock' AND query LIKE '%UPDATE liekan_analysis_query q SET status=%') AS blocked",
+            );
+            if (activity.blocked) {
+              blocked = true;
+              break;
+            }
+            await new Promise(resolve => setTimeout(resolve, 5));
+          }
+          if (legacy) expect(blocked).toBe(true);
+        } finally {
+          resume();
+          await Promise.all([joining, cancellation]);
+        }
+        expect(
+          (await q('SELECT status FROM liekan_analysis_query WHERE id=$1::uuid', id))[0].status,
+        ).toBe(legacy ? 'failed' : 'queued');
+        expect(
+          (
+            await q(
+              'SELECT lease_until>clock_timestamp() AS active FROM liekan_analysis_query_viewer WHERE job_id=$1::uuid AND viewer_id=$2::uuid',
+              id,
+              joiningView,
+            )
+          )[0].active,
+        ).toBe(true);
+      }
+    },
+  );
+  it('allows concurrent same-actor joins while callbacks update task timing and reproduces the old lock upgrade', async () => {
+    const first = await withAnalysisViewer(randomUUID(), () => read(true, site, 'ai/pages'));
+    if (first.ready) throw new Error('expected cold producer');
+    const id = first.analysisJob.id;
+    for (const legacy of [true, false]) {
+      let entered!: () => void,
+        resume!: () => void,
+        callbacks = 0;
+      const callbackEntered = new Promise<void>(resolve => (entered = resolve)),
+        gate = new Promise<void>(resolve => (resume = resolve));
+      const join = () =>
+        analysisTransaction(tx =>
+          withAnalysisViewer(randomUUID(), async () => {
+            const registration = legacy
+              ? new Proxy(tx, {
+                  get(target, key) {
+                    if (key !== '$executeRawUnsafe') return Reflect.get(target, key);
+                    return (statement: string, ...values: unknown[]) =>
+                      target.$executeRawUnsafe(
+                        statement.replace('FOR KEY SHARE', 'FOR SHARE'),
+                        ...values,
+                      );
+                  },
+                })
+              : tx;
+            await registerAnalysisViewer(registration, id, actors[0].id);
+            if (++callbacks === 1) {
+              entered();
+              await gate;
+            }
+            await tx.$executeRawUnsafe(
+              'UPDATE liekan_analysis_query SET next_attempt_at=clock_timestamp() WHERE id=$1::uuid',
+              id,
+            );
+          }),
+        );
+      const a = join();
+      const checkedA = a.then(
+        () => ({ ok: true as const }),
+        error => ({ ok: false as const, error }),
+      );
+      await callbackEntered;
+      const b = join();
+      const checkedB = b.then(
+        () => ({ ok: true as const }),
+        error => ({ ok: false as const, error }),
+      );
+      try {
+        let blocked = false;
+        for (let i = 0; i < 100; i++) {
+          const [row] = await q(
+            "SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE datname=current_database() AND wait_event_type='Lock' AND query LIKE '%INSERT INTO liekan_analysis_query_consumer%') AS blocked",
+          );
+          if (row.blocked) {
+            blocked = true;
+            break;
+          }
+          await new Promise(resolve => setTimeout(resolve, 5));
+        }
+        expect(blocked).toBe(true);
+      } finally {
+        resume();
+      }
+      const results = await Promise.all([checkedA, checkedB]);
+      if (legacy) {
+        const failure = results.find(v => !v.ok);
+        expect(failure).toBeDefined();
+        expect(String((failure as any).error)).toMatch(/deadlock detected|lock timeout/);
+      } else expect(results.every(v => v.ok)).toBe(true);
+    }
+  });
+  it('parks disconnected queued viewers after their leases expire and frees actor admission', async () => {
+    const task = await withAnalysisViewer(randomUUID(), () => read());
+    if (task.ready) throw new Error('expected cold producer');
+    await sql(
+      "UPDATE liekan_analysis_query_viewer SET lease_until=clock_timestamp()-interval '1 second' WHERE job_id=$1::uuid",
+      task.analysisJob.id,
+    );
+    await pumpAnalysisQueries({ send: vi.fn(), update: vi.fn() });
+    expect(
+      (
+        await q(
+          'SELECT status,error_code FROM liekan_analysis_query WHERE id=$1::uuid',
+          task.analysisJob.id,
+        )
+      )[0],
+    ).toEqual({ status: 'failed', error_code: 'analysis-idle' });
+    await expect(
+      withAnalysisViewer(randomUUID(), () => read(true, site, 'ai/pages')),
+    ).resolves.toMatchObject({ ready: false });
+  });
+  it('admits at most two foreground computations across independent callers', async () => {
+    let release!: () => void,
+      entered = 0;
+    const gate = new Promise<void>(resolve => (release = resolve));
+    const hold = () =>
+      withAnalysisPermit('dashboard', async () => {
+        entered++;
+        await gate;
+      });
+    const first = hold();
+    while (entered < 1) await new Promise(resolve => setTimeout(resolve, 5));
+    const second = hold();
+    while (entered < 2) await new Promise(resolve => setTimeout(resolve, 5));
+    try {
+      expect(
+        (
+          await withAnalysisPermit('dashboard', async () => {
+            throw new Error('third slot');
+          })
+        ).acquired,
+      ).toBe(false);
+      expect(
+        (
+          await q(
+            'SELECT count(*)::int AS n FROM liekan_analysis_read_lease WHERE lease_until>clock_timestamp()',
+          )
+        )[0].n,
+      ).toBe(2);
+    } finally {
+      release();
+      await Promise.all([first, second]);
+    }
+    expect(await withAnalysisPermit('dashboard', async () => 7)).toMatchObject({
+      acquired: true,
+      value: 7,
+    });
+  });
+  it('yields a new inline read to the older waiting website head', async () => {
+    await sql("UPDATE liekan_analysis_site SET mode='live' WHERE website_id=$1::uuid", otherSite);
+    const first = await withAnalysisViewer(randomUUID(), () => read(true, site, 'ai/pages'));
+    const second = await withAnalysisViewer(randomUUID(), () =>
+      read(true, otherSite, 'ai/pages', actors[1]),
+    );
+    if (first.ready || second.ready) throw new Error('expected cold producers');
+    expect((await processAnalysisQuery(second.analysisJob.id, { firstPage: true })).acquired).toBe(
+      false,
+    );
+    expect(
+      (
+        await q(
+          'SELECT attempts,fast_attempted_at FROM liekan_analysis_query WHERE id=$1::uuid',
+          second.analysisJob.id,
+        )
+      )[0],
+    ).toEqual({ attempts: 0, fast_attempted_at: null });
+    await finish(first.analysisJob.id);
+    expect((await processAnalysisQuery(second.analysisJob.id, { firstPage: true })).acquired).toBe(
+      true,
+    );
+  });
+  it('bounds viewer receipts and reclaims expired leases on the next read', async () => {
+    let id = '';
+    for (let i = 0; i < 32; i++) {
+      const task = await withAnalysisViewer(randomUUID(), () => read());
+      if (task.ready) throw new Error('expected cold producer');
+      id = task.analysisJob.id;
+    }
+    await expect(withAnalysisViewer(randomUUID(), () => read())).rejects.toMatchObject({
+      status: 429,
+    });
+    await sql(
+      "UPDATE liekan_analysis_query_viewer SET lease_until=clock_timestamp()-interval '1 second' WHERE job_id=$1::uuid",
+      id,
+    );
+    await withAnalysisViewer(randomUUID(), () => read());
+    expect(
+      (
+        await q(
+          'SELECT count(*)::int AS n FROM liekan_analysis_query_viewer WHERE job_id=$1::uuid',
+          id,
+        )
+      )[0].n,
+    ).toBeLessThanOrEqual(1);
+  });
+  it('bounds published physical facts independently of manifest source counts', async () => {
+    const { createAnalysisBuild, runOneAnalysisWorkUnit } = await import('./analysis-rollups');
+    const input = { ...parameters('ai/pages'), crawlerMetricsVersion: 1 };
+    const start = new Date(Number(input.startAt)),
+      end = new Date(+start + 3600000);
+    const build = await withPublishedRegistry(() =>
+      createAnalysisBuild(
+        site,
+        { userId: actors[0].id },
+        {
+          startDate: start,
+          endDate: end,
+          timezone: 'Asia/Shanghai',
+          locale: 'zh-CN',
+          requestId: randomUUID(),
+        },
+      ),
+    );
+    for (let i = 0; i < 20; i++) {
+      const [state] = await q(
+        'SELECT status FROM liekan_analysis_build WHERE id=$1::uuid',
+        build.id,
+      );
+      if (state.status === 'completed') break;
+      await withPublishedRegistry(() => runOneAnalysisWorkUnit(build.id));
+    }
+    // This isolated synthetic publication represents many source requests in one scanned fact.
+    await sql(
+      "UPDATE liekan_analysis_manifest SET row_count=9000000 WHERE website_id=$1::uuid AND family='log'",
+      site,
+    );
+    await sql(
+      `INSERT INTO liekan_analysis_log(website_id,generation,grain,bucket,dimensions,dimension_key,requests,first_at,last_at)
+      SELECT website_id,generation,'5m',bucket,'{}'::jsonb,'synthetic-compressed-fact',9000000,bucket,bucket FROM liekan_analysis_manifest WHERE website_id=$1::uuid AND family='log' LIMIT 1`,
+      site,
+    );
+    expect(
+      await withPublishedRegistry(() => canReadFirstPage(site, input, Date.now() + 5000)),
+    ).toBe(true);
+  });
+  it('uses physical bounded gaps for fast-page admission and defers large raw gaps', async () => {
+    const input = { ...parameters('ai/pages'), crawlerMetricsVersion: 1 };
+    expect(await canReadFirstPage(site, input, Date.now() + 5000)).toBe(true);
+    const imported = randomUUID();
+    await sql(
+      'INSERT INTO liekan_import(id,website_id,digest,accepted,rejected) VALUES($1::uuid,$2::uuid,$1,20001,0)',
+      imported,
+      site,
+    );
+    await sql(
+      `INSERT INTO liekan_log(id,website_id,import_id,created_at,path,method,status,bytes,ip_masked,ip_hash,user_agent,location,bot,vendor,bot_type,verification,ai_eligible,recognition_state)
+      SELECT 'synthetic-admission-'||g,$1::uuid,$2::uuid,$3::timestamptz,'/test','GET',200,0,'','','GPTBot/1.0','','GPTBot','OpenAI','训练','verified_range',true,'recognized' FROM generate_series(1,20001) g`,
+      site,
+      imported,
+      new Date(Number(input.startAt) + 1000),
+    );
+    expect(await canReadFirstPage(site, input, Date.now() + 5000)).toBe(false);
   });
   it('registers foreground demand while a build holds shared authority', async () => {
     const task = await withSharedAuthority(() => read());
@@ -281,7 +732,7 @@ describe.skipIf(!enabled)('ordinary dashboard demand scheduling in owned Postgre
       vi.mocked(execution.executeAnalysisQuery).mockImplementationOnce(async () => {
         if (change === 'lease')
           await sql(
-            'UPDATE liekan_analysis_dashboard_lease SET token=$1::uuid,epoch=epoch+1 WHERE id',
+            'UPDATE liekan_analysis_read_lease SET token=$1::uuid,epoch=epoch+1 WHERE token IS NOT NULL',
             randomUUID(),
           );
         else if (change === 'permission')
@@ -345,7 +796,7 @@ describe.skipIf(!enabled)('ordinary dashboard demand scheduling in owned Postgre
     expect((await withAnalysisPermit('history', async () => true)).acquired).toBe(true);
     expect((await withAnalysisPermit('incremental', async () => true)).acquired).toBe(true);
     expect((await withAnalysisPermit('preheat', async () => true)).acquired).toBe(true);
-    await withAnalysisPermit('dashboard', async () => {
+    await withBlockedLane('dashboard', async () => {
       expect((await processAnalysisQuery(task.analysisJob.id)).acquired).toBe(false);
       expect(
         (
@@ -628,8 +1079,8 @@ describe.skipIf(!enabled)('ordinary dashboard demand scheduling in owned Postgre
           )[0],
         ).toEqual({ status: 'ready', attempts: 1 });
         expect(
-          (await q('SELECT token FROM liekan_analysis_dashboard_lease WHERE id'))[0].token,
-        ).toBeNull();
+          await q('SELECT token FROM liekan_analysis_read_lease WHERE token IS NOT NULL'),
+        ).toEqual([]);
         expect(
           await boss.findJobs(ANALYSIS_QUERY_QUEUE, { key: successorId, queued: true }),
         ).toHaveLength(1);
@@ -732,7 +1183,7 @@ describe.skipIf(!enabled)('ordinary dashboard demand scheduling in owned Postgre
         includeMetadata: true,
       });
       const send = vi.spyOn(boss, 'send');
-      await withAnalysisPermit('dashboard', () => processAnalysisQueryDelivery(delivery, boss));
+      await withBlockedLane('dashboard', () => processAnalysisQueryDelivery(delivery, boss));
       expect(send).not.toHaveBeenCalled();
       expect(
         (
@@ -760,7 +1211,7 @@ describe.skipIf(!enabled)('ordinary dashboard demand scheduling in owned Postgre
         );
         const fail = vi.spyOn(boss, 'fail');
         if (occupied)
-          await withAnalysisPermit('dashboard', () => processAnalysisQueryDelivery(delivery, boss));
+          await withBlockedLane('dashboard', () => processAnalysisQueryDelivery(delivery, boss));
         else await processAnalysisQueryDelivery(delivery, boss);
         const execution = await import('./analysis-query-execution');
         expect(execution.executeAnalysisQuery).not.toHaveBeenCalled();

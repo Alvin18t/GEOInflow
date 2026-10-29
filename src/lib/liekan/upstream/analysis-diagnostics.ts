@@ -90,7 +90,11 @@ type AttemptRow = {
   started_at: Date | null;
 };
 /** One bounded record per owned compute attempt, including failed publication and recovery. */
-export function analysisAttemptDiagnostics(row: AttemptRow, nextAttemptAt: Date | null) {
+export function analysisAttemptDiagnostics(
+  row: AttemptRow,
+  nextAttemptAt: Date | null,
+  executionPath: 'worker' | 'foreground' = 'worker',
+) {
   const start = performance.now();
   const groups: ReportTimings = {};
   let computeMs = 0,
@@ -129,6 +133,7 @@ export function analysisAttemptDiagnostics(row: AttemptRow, nextAttemptAt: Date 
       console.info(
         JSON.stringify({
           event: 'analysis-attempt',
+          executionPath,
           taskId: taskId(row.id),
           target: analysisTargetCategory(row.target),
           attempt: row.attempts,

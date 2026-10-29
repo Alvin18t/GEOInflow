@@ -4,6 +4,12 @@ import { noteCacheResult } from './cache-context';
 import { LiekanError } from './errors';
 import { analysisQueryParameters } from './analysis-query-model';
 import { processSingleton } from './process-singleton';
+import {
+  analysisViewerId,
+  withAnalysisViewer,
+  releaseAnalysisViewer,
+  retainPublishedAnalysisViewer,
+} from './analysis-viewers';
 
 const handoffs = processSingleton(
   'analysis-early-handoffs',
@@ -91,10 +97,38 @@ export async function asyncAnalysisResponse(request: Request, websiteId: string,
   const locale =
     readLocaleCookie(request.headers.get('cookie') || '') ||
     (request.headers.get('accept-language')?.startsWith('en') ? 'en-US' : 'zh-CN');
-  const value = await requestDashboardSnapshot(access.website.id, actor, target, query, locale);
+  const viewerId = analysisViewerId(request);
+  const admittedAt = performance.now();
+  let value = await withAnalysisViewer(viewerId, () =>
+    requestDashboardSnapshot(access.website.id, actor, target, query, locale),
+  );
+  const admissionMs = performance.now() - admittedAt;
+  const foregroundAt = performance.now();
+  let readPath = value.ready ? 'published' : 'queued';
+  if (viewerId && !value.ready && target === 'feature:page-report' && query.refresh !== '1') {
+    const { processAnalysisQuery, readAnalysisQuery } = await import('./analysis-queries');
+    const attempted = await processAnalysisQuery(value.analysisJob.id, { firstPage: true });
+    if (attempted.acquired && attempted.value === undefined) {
+      const result = await readAnalysisQuery(access.website.id, actor, value.analysisJob.id, true);
+      if (result.ready) {
+        value = result;
+        readPath = 'foreground';
+      }
+    }
+  }
+  const foregroundMs = performance.now() - foregroundAt;
   const dispatchId = value.ready === false ? value.analysisJob.id : dashboardRefreshJobId(value);
+  if (viewerId && value.ready && dispatchId)
+    await withAnalysisViewer(viewerId, () =>
+      retainPublishedAnalysisViewer(access.website.id, actor.id, dispatchId),
+    ).catch(() => false);
   if (dispatchId) await earlyHandoff(dispatchId);
   const response = analysisResponse(value);
+  response.headers.set('X-Liekan-Read-Path', readPath);
+  response.headers.append(
+    'Server-Timing',
+    `analysis-admission;dur=${admissionMs.toFixed(1)},analysis-foreground;dur=${foregroundMs.toFixed(1)}`,
+  );
   if ('dataThrough' in value && 'snapshotState' in value) {
     response.headers.set('X-Liekan-Data-Through', String(value.dataThrough));
     response.headers.set('X-Liekan-Snapshot-State', String(value.snapshotState));
@@ -113,7 +147,25 @@ export async function analysisJobResponse(
   if (!z.uuid().safeParse(jobId).success) throw new LiekanError('统计任务标识无效', 400);
   const actor = await authenticateCrawlerMaintenance(request);
   const access = await authorize(request, websiteId);
-  const data = await readAnalysisQuery(access.website.id, actor, jobId, result);
+  const data = await withAnalysisViewer(analysisViewerId(request), () =>
+    readAnalysisQuery(access.website.id, actor, jobId, result),
+  );
   if (!result) return Response.json(data, { headers: { 'Cache-Control': 'private, no-store' } });
   return analysisResponse(data);
+}
+
+export async function releaseAnalysisJobResponse(
+  request: Request,
+  websiteId: string,
+  jobId: string,
+) {
+  const { authenticateCrawlerMaintenance } = await import('./crawler-maintenance');
+  const { authorize } = await import('./server');
+  const actor = await authenticateCrawlerMaintenance(request);
+  const access = await authorize(request, websiteId);
+  if (!z.uuid().safeParse(jobId).success) throw new LiekanError('统计任务标识无效', 400);
+  const released = await withAnalysisViewer(analysisViewerId(request), () =>
+    releaseAnalysisViewer(access.website.id, actor, jobId),
+  );
+  return Response.json(released, { headers: { 'Cache-Control': 'private, no-store' } });
 }

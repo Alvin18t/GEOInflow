@@ -1,4 +1,4 @@
-import { withinQuerySnapshot } from './query-snapshot';
+import { getQuerySnapshot, withinQuerySnapshot } from './query-snapshot';
 // @vitest-environment node
 import { createHash, randomUUID } from 'node:crypto';
 import { writeFile } from 'node:fs/promises';
@@ -212,6 +212,116 @@ describe.skipIf(!enabled)('exact rollups in an owned isolated PostgreSQL schema'
       site,
     );
   });
+  it('preserves the existing five-minute trend labels through a historical midnight fold', async () => {
+    await log('2009-11-01T03:00:30Z');
+    await log('2009-11-01T03:01:30Z');
+    const rows = await api.readAnalysisLogSeries({
+      ...input(), startDate: new Date('2009-11-01T03:00Z'), endDate: new Date('2009-11-01T04:00Z'),
+      timezone: 'America/Goose_Bay', grain: 'day',
+    });
+    expect(rows).toEqual([{ day: '2009-11-01', bot: 'GPTBot', type: '训练', count: 2, aiRequests: 2 }]);
+  });
+  it('keeps crawler context exact across raw gaps, covered visits and late identity corrections', async () => {
+    await event('2026-01-01T00:01:00Z');
+    await event('2026-01-01T00:10:00Z', { type: 2 });
+    await event('2026-01-01T01:20:00Z', { visit: randomUUID() });
+    const changed = await event('2026-01-01T01:30:00Z');
+    const missing = await event('2026-01-01T01:31:00Z');
+    await execute('UPDATE liekan_event_environment SET identity_available=false WHERE event_id=$1::uuid', missing);
+    await event('2026-01-01T01:40:00Z', { type: 5 });
+    const { getHumanFacts } = await import('./analytics');
+    const { reportSnapshot } = await import('./server');
+    const ranges = [
+      [from, new Date(+from + 7200000)],
+      [new Date(+from + 1234567), new Date(+from + 6543210)],
+      [from, new Date('2026-01-01T01:30:00Z')],
+    ];
+    const verify = async () => {
+      for (const [starts, ends] of ranges) {
+        const expected = await reportSnapshot(() => getHumanFacts(site, starts, ends, 'Asia/Shanghai', ['daily']));
+        const actual = await reportSnapshot(() => getHumanFacts(site, starts, ends, 'Asia/Shanghai', ['daily'], undefined, { crawlerContext: true }));
+        expect(actual.totals).toEqual(expected.totals);
+        expect(actual.population).toEqual(expected.population);
+        expect(actual.daily.map(row => row.day)).toEqual(expected.daily.map(row => row.day));
+      }
+    };
+    await verify();
+    await finish(await build(from, new Date(+from + 3600000)));
+    await verify();
+    await finish(await build(from, new Date(+from + 7200000)));
+    await verify();
+    await execute('UPDATE liekan_event_environment SET identity_available=false WHERE event_id=$1::uuid', changed);
+    await verify();
+  });
+  it.each([
+    ['Asia/Kolkata', '2026-01-01T18:40:00Z'],
+    ['Asia/Kathmandu', '2026-01-01T18:20:00Z'],
+    ['Australia/Lord_Howe', '2026-06-01T13:40:00Z'],
+    ['America/Goose_Bay', '2009-11-01T03:10:00Z'],
+  ])('keeps crawler local date labels across covered UTC hours in %s', async (timezone, at) => {
+    await event(at);
+    const hour = new Date(Math.floor(+new Date(at) / 3600000) * 3600000);
+    const starts = new Date(+hour - 86400000), ends = new Date(+hour + 86400000);
+    const { getHumanFacts } = await import('./analytics');
+    const { reportSnapshot } = await import('./server');
+    const expected = await reportSnapshot(() => getHumanFacts(site, starts, ends, timezone, ['daily']));
+    await finish(await api.createAnalysisBuild(site, actor, {
+      startDate: hour, endDate: new Date(+hour + 3600000), timezone, locale: 'zh-CN', requestId: randomUUID(),
+    }));
+    const actual = await reportSnapshot(() => getHumanFacts(site, starts, ends, timezone, ['daily'], undefined, { crawlerContext: true }));
+    expect(actual.totals).toEqual(expected.totals);
+    expect(actual.daily.map(row => row.day)).toEqual(expected.daily.map(row => row.day));
+  });
+  it('shares crawler context with exact content preference page facts', async () => {
+    await event('2026-01-01T00:01:00Z');
+    await event('2026-01-01T00:02:00Z');
+    await event('2026-01-01T01:03:00Z', { type: 2 });
+    const { getHumanFacts } = await import('./analytics');
+    const { reportSnapshot } = await import('./server');
+    const expected = await reportSnapshot(() => getHumanFacts(site, from, until, 'Asia/Shanghai', ['pages']));
+    const factual: string[] = [];
+    const actual = await reportSnapshot(() => {
+      const snapshot = getQuerySnapshot();
+      return withinQuerySnapshot({
+        $executeRawUnsafe: (sql, ...values) => snapshot.$executeRawUnsafe(sql, ...values),
+        $queryRawUnsafe: async (sql, ...values) => {
+          const rows = await snapshot.$queryRawUnsafe(sql, ...values) as any[];
+          if (rows[0] && ['facts', 'pageviews', 'qualifiedVisitors'].some(key => Object.hasOwn(rows[0], key))) factual.push(sql);
+          return rows;
+        },
+      }, () => getHumanFacts(site, from, until, 'Asia/Shanghai', ['pages'], undefined, { crawlerContext: true }));
+    });
+    expect(actual.pages).toEqual(expected.pages);
+    expect(actual.totals).toEqual(expected.totals);
+    expect(actual.population).toEqual(expected.population);
+    expect(factual).toHaveLength(2);
+  });
+  it('reads crawler date labels, real totals and population in one factual statement', async () => {
+    await event('2026-01-01T00:01:00Z');
+    await event('2026-01-02T00:02:00Z', { visit: randomUUID() });
+    const unknown = await event('2026-01-02T00:03:00Z');
+    await execute('UPDATE liekan_event_environment SET identity_available=false WHERE event_id=$1::uuid', unknown);
+    const { getHumanFacts } = await import('./analytics');
+    const { reportSnapshot } = await import('./server');
+    const expected = await reportSnapshot(() => getHumanFacts(site, from, until, 'Asia/Shanghai', ['daily']));
+    const factual: string[] = [];
+    const actual = await reportSnapshot(() => {
+      const snapshot = getQuerySnapshot();
+      return withinQuerySnapshot({
+        $executeRawUnsafe: (sql, ...values) => snapshot.$executeRawUnsafe(sql, ...values),
+        $queryRawUnsafe: async (sql, ...values) => {
+          const rows = await snapshot.$queryRawUnsafe(sql, ...values) as any[];
+          if (rows[0] && ['facts', 'pageviews', 'qualifiedVisitors'].some(key => Object.hasOwn(rows[0], key))) factual.push(sql);
+          return rows;
+        },
+      }, () => Reflect.apply(getHumanFacts, undefined, [site, from, until, 'Asia/Shanghai', ['daily'], undefined, { crawlerContext: true }]));
+    });
+    expect(actual.totals).toEqual(expected.totals);
+    expect(actual.daily.map(row => row.day)).toEqual(expected.daily.map(row => row.day));
+    expect(actual.population.identity).toMatchObject({ eligiblePV: 3, qualifiedPV: 2, status: 'partial' });
+    expect(factual.length).toBeGreaterThan(0);
+    expect(factual).toHaveLength(1);
+  });
   it('recovers a capacity-limited automatic unit after space returns without replacing its receipt', async () => {
     const start = new Date(Math.floor((Date.now() - 7200000) / 3600000) * 3600000);
     await log(new Date(+start + 60000).toISOString());
@@ -412,6 +522,97 @@ describe.skipIf(!enabled)('exact rollups in an owned isolated PostgreSQL schema'
       expect(withoutCoverage(await api.readAnalysisLogRollup(input()))).toEqual(before);
     },
   );
+  it('indexes disjoint uncovered gaps without scanning the covered middle', async () => {
+    await log('2026-01-01T00:03:00Z');
+    await log('2026-01-01T00:08:00Z');
+    const window = {
+      ...input(),
+      startDate: new Date('2025-12-31T00:00Z'),
+      endDate: new Date('2026-01-02T00:00Z'),
+      grain: 'hour' as const,
+    };
+    const raw = await api.readAnalysisLogSeries(window);
+    await finish(await shortLogBuild(from, new Date(+from + 3600000)));
+    const rawScans: any[] = [];
+    const actual = await db.analysisTransaction(async tx => {
+      await tx.$executeRawUnsafe('SET LOCAL enable_seqscan=off');
+      return withinQuerySnapshot(
+        new Proxy(tx, {
+          get(target, key) {
+            if (key !== '$queryRawUnsafe') return Reflect.get(target, key);
+            return async (statement: string, ...values: unknown[]) => {
+              if (statement.includes('reporting_bounds AS MATERIALIZED')) {
+                const [row] = await target.$queryRawUnsafe<any[]>(
+                  `EXPLAIN(ANALYZE,FORMAT JSON) ${statement}`,
+                  ...values,
+                );
+                const visit = (node: any) => {
+                  if (node['Relation Name'] === 'liekan_log') rawScans.push(node);
+                  for (const child of node.Plans || []) visit(child);
+                };
+                visit(row['QUERY PLAN'][0].Plan);
+              }
+              return target.$queryRawUnsafe(statement, ...values);
+            };
+          },
+        }),
+        () => api.readAnalysisLogSeries(window),
+      );
+    });
+    expect(actual).toEqual(raw);
+    expect(actual.reduce((sum, row) => sum + row.count, 0)).toBe(2);
+    expect(rawScans.length).toBeGreaterThan(0);
+    expect(rawScans.every(node => !node['Actual Rows'] && !node['Rows Removed by Filter'])).toBe(
+      true,
+    );
+  });
+  it('preserves cursor versions and prior-period form metrics across covered and raw populations', async () => {
+    const first = await log('2026-01-01T00:03:00Z');
+    const second = await log('2026-01-01T01:03:00Z', { verification: 'verified_dns' });
+    const excluded = await log('2026-01-01T01:04:00Z', { selfCheck: true });
+    for (const [id, version] of [
+      [first, 'rules-a'],
+      [second, 'rules-z'],
+      [excluded, 'excluded'],
+    ])
+      await execute(
+        `INSERT INTO liekan_crawler_evidence(website_id,log_id,classification_version) VALUES($1::uuid,$2,$3)`,
+        site,
+        id,
+        version,
+      );
+    await log('2026-01-01T01:05:00Z', { ai: null, state: null });
+    const { getLogFacts } = await import('./logs');
+    const read = () =>
+      getLogFacts(
+        site,
+        new Date('2026-01-01T01:00Z'),
+        new Date('2026-01-01T02:00Z'),
+        'UTC',
+        1,
+        '',
+        '',
+        '',
+        'after',
+        ['summary', 'bots', 'previousBots', 'recent'],
+        { crawlerIdentityScope: 'all', crawlerMetricsVersion: 1, resource: 'ai/bots' },
+      );
+    const raw = await read();
+    await finish(await shortLogBuild(from, new Date(+from + 7200000)));
+    expect(await read()).toEqual(raw);
+    expect(
+      (await api.readAnalysisLogRollup(input({ fields: ['classificationSet'] }))).classificationSet,
+    ).toBe('rules-a,rules-z');
+    expect(
+      (
+        await api.readAnalysisLogRollup(
+          input({ fields: ['classificationSet'], crawlerIdentityScope: 'verified_range' }),
+        )
+      ).classificationSet,
+    ).toBe('rules-a');
+    expect(raw.previousBots[0].requests).toBe(1);
+    expect(raw.recent).toHaveLength(2);
+  });
   it('matches exact raw log populations, encoded paths and all verification scopes', async () => {
     await log('2026-01-01T00:03:00Z');
     await log('2026-01-01T00:08:00Z', { verification: 'verified_dns', path: '/space%20here' });

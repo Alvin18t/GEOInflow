@@ -66,6 +66,8 @@ export const analysisTables = [
   'liekan_analysis_query_consumer',
   'liekan_analysis_background_lease',
   'liekan_analysis_dashboard_lease',
+  'liekan_analysis_read_lease',
+  'liekan_analysis_query_viewer',
   'liekan_analysis_probe',
   'liekan_dashboard_snapshot',
   'liekan_dashboard_dirty',
@@ -170,22 +172,21 @@ export function analysisLogDimensionsSql(productFormSql: string) {
  'staticResource',l.path ~* '${staticRequestExtensionPattern}',
  'productForm',${productFormSql})`;
 }
-/** Bound physical keys before policy expansion and resolve each immutable catalog once. */
-export function analysisLogRawFactsSql(gaps: 'reporting_gaps' | 'series_gaps' | 'expansion_gaps') {
+/** Read each disjoint gap through the canonical reporting view with indexed time bounds. */
+export function analysisLogRawRowsSql(gaps: 'reporting_gaps' | 'series_gaps' | 'expansion_gaps') {
   return `reporting_bounds AS MATERIALIZED(
-   SELECT min(starts) AS starts,max(ends) AS ends,range_agg(tstzrange(starts,ends,'[)')) AS spans FROM ${gaps} HAVING count(*)>0
-  ), reporting_keys AS MATERIALIZED(
-   SELECT k.id FROM reporting_bounds b CROSS JOIN LATERAL(
-    SELECT l.id FROM (TABLE liekan_log) l WHERE l.website_id=$1::uuid
-     AND l.created_at>=b.starts AND l.created_at<b.ends AND l.created_at<@b.spans OFFSET 0
-   ) k
+   SELECT lower(span) AS starts,upper(span) AS ends
+   FROM (SELECT unnest(range_agg(tstzrange(starts,ends,'[)'))) AS span FROM ${gaps}) merged
   ), reporting_raw AS MATERIALIZED(
-   SELECT l.* FROM reporting_keys k CROSS JOIN LATERAL(
+   SELECT l.* FROM reporting_bounds b CROSS JOIN LATERAL(
     SELECT l.path,l.created_at,l.bot,l.vendor,l.bot_type,l.reporting_crawler_id,l.reporting_catalog_version,
      l.reporting_classification_version,l.ai_eligible,l.recognition_state,l.verification,l.user_agent,l.status
-    FROM liekan_reporting_log l WHERE l.website_id=$1::uuid AND l.id=k.id OFFSET 0
+    FROM liekan_reporting_log l WHERE l.website_id=$1::uuid AND l.created_at>=b.starts AND l.created_at<b.ends OFFSET 0
    ) l
-  ), reporting_catalogs AS MATERIALIZED(
+  )`;
+}
+export function analysisLogRawFactsSql(gaps: 'reporting_gaps' | 'series_gaps' | 'expansion_gaps') {
+  return `${analysisLogRawRowsSql(gaps)}, reporting_catalogs AS MATERIALIZED(
    SELECT DISTINCT reporting_catalog_version FROM reporting_raw WHERE reporting_catalog_version IS NOT NULL
   ), reporting_forms AS MATERIALIZED(
    SELECT DISTINCT ON(v.version,item.identity->>'id') v.version,item.identity->>'id' AS crawler_id,

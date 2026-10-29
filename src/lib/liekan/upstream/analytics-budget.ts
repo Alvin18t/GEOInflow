@@ -73,7 +73,7 @@ export const analyticsGate = processSingleton(
 );
 const dashboardGate = processSingleton(
   'analytics-dashboard-computation-gate',
-  () => new AnalyticsGate(1),
+  () => new AnalyticsGate(2),
 );
 
 /** Match the database permits with bounded process-local computation slots. */

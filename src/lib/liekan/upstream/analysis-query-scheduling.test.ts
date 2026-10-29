@@ -1,6 +1,12 @@
 // @vitest-environment node
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
-const m = vi.hoisted(() => ({ query: vi.fn(), write: vi.fn(), compute: vi.fn(), permit: vi.fn() }));
+const m = vi.hoisted(() => ({
+  query: vi.fn(),
+  write: vi.fn(),
+  compute: vi.fn(),
+  permit: vi.fn(),
+  admission: vi.fn(),
+}));
 vi.mock('@/lib/auth', () => ({ hasPermission: async () => false }));
 vi.mock('../crawlers/published', () => ({ getPublishedCatalog: () => undefined }));
 vi.mock('./crawler-registry-context', () => ({ withPublishedRegistry: (work: any) => work() }));
@@ -18,6 +24,11 @@ vi.mock('./ai-db', () => ({ aiExecutor: (tx: unknown) => tx }));
 vi.mock('./crawler-access', () => ({ authorizeCrawler: async () => ({ id: 'site' }) }));
 vi.mock('./analytics-revision', () => ({
   readAnalyticsVersions: async () => ({ strong: 'strong' }),
+}));
+vi.mock('./analysis-page-admission', () => ({
+  firstPageRange: () => ({ start: new Date(0), end: new Date(1000) }),
+  canReadFirstPage: m.admission,
+  FIRST_PAGE_BUDGET_MS: 750,
 }));
 vi.mock('./analysis-background', () => ({ withAnalysisPermit: m.permit }));
 vi.mock('./analysis-query-execution', () => ({ executeAnalysisQuery: m.compute }));
@@ -55,13 +66,16 @@ beforeEach(() => {
     value: await work(() => true, { token: 'token', epoch: '1' }),
   }));
   m.query.mockImplementation(async (sql: string) => {
+    if (sql.startsWith('SELECT q.id FROM liekan_analysis_query q WHERE')) return [];
     if (sql.startsWith('SELECT q.*')) return [{ ...row }];
     if (sql.startsWith('UPDATE liekan_analysis_query'))
       return [{ ...row, attempts: row.attempts + 1, started_at: new Date() }];
     if (sql.startsWith('SELECT s.epoch')) return [{ epoch: 1n, mode: 'raw', siteNumber: 1 }];
-    if (sql.startsWith('SELECT id FROM')) return [{ id: true }];
+    if (sql.startsWith('SELECT id FROM') || sql.startsWith('SELECT 1 FROM liekan_analysis_'))
+      return [{ id: true }];
     throw new Error('Unexpected scheduling query');
   });
+  m.admission.mockResolvedValue(true);
   m.write.mockResolvedValue(1);
   m.compute.mockResolvedValue({ pageviews: 1 });
 });
@@ -144,4 +158,51 @@ it('keeps a failed dashboard computation on its durable retry without a successo
   await processAnalysisQueryDelivery({ id: row.id, retryCount: 0, data: { id: row.id } }, boss);
   expect(m.query.mock.calls.some(([sql]) => sql.includes('true AS foreground'))).toBe(false);
   expect(boss.send).not.toHaveBeenCalled();
+});
+
+it('publishes the existing report with a shared 750ms foreground deadline', async () => {
+  m.compute.mockImplementation(async () => {
+    expect(currentCacheContext().deadline - Date.now()).toBeGreaterThan(650);
+    expect(currentCacheContext().deadline - Date.now()).toBeLessThanOrEqual(750);
+    return { pageviews: 7 };
+  });
+  expect((await processAnalysisQuery(row.id, { firstPage: true })).value).toBeUndefined();
+  expect(m.admission).toHaveBeenCalledOnce();
+  expect(
+    m.query.mock.calls.some(([sql]) => sql.includes('fast_attempted_at=clock_timestamp()')),
+  ).toBe(true);
+  expect(m.write.mock.calls.some(([sql]) => sql.includes("SET status='ready'"))).toBe(true);
+});
+it.each(['oversized', 'timeout', 'metadata'])(
+  'returns %s foreground work to the same queued task without worker backoff',
+  async reason => {
+    if (reason === 'oversized') m.admission.mockResolvedValue(false);
+    else {
+      const { LiekanError } = await import('./errors');
+      m.admission.mockRejectedValue(
+        new LiekanError(
+          'bounded',
+          503,
+          reason === 'metadata' ? 'liekan-error' : 'analysis-query-timeout',
+        ),
+      );
+    }
+    const result = await processAnalysisQuery(row.id, { firstPage: true });
+    expect(result.value).toBeInstanceOf(Error);
+    expect(m.compute).not.toHaveBeenCalled();
+    const reset = m.write.mock.calls.find(([sql]) =>
+      sql.includes('attempts=greatest(0,attempts-1)'),
+    );
+    expect(reset?.[0]).toContain('next_attempt_at=clock_timestamp()');
+    expect(m.write.mock.calls.some(([sql]) => sql.includes('WHEN 1 THEN 5'))).toBe(false);
+  },
+);
+it('keeps a foreground permission failure fenced instead of treating it as a budget deferral', async () => {
+  const { LiekanError } = await import('./errors');
+  m.admission.mockRejectedValue(new LiekanError('denied', 403));
+  await processAnalysisQuery(row.id, { firstPage: true });
+  expect(m.write.mock.calls.some(([sql]) => sql.includes('attempts=greatest'))).toBe(false);
+  expect(
+    m.write.mock.calls.some(([sql, ...args]) => sql.includes('WHEN 1 THEN 5') && args[2] === 403),
+  ).toBe(true);
 });

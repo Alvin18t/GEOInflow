@@ -2,7 +2,7 @@ import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { QueryCache, type CachedResult } from './query-cache';
 import { installAnalyticsRuntime } from './analytics-runtime';
 import { AnalyticsRedis } from './analytics-redis';
-import { analyticsGate, AnalyticsGate } from './analytics-budget';
+import { analyticsGate, AnalyticsGate, analyticsComputationGate } from './analytics-budget';
 import { getQuerySnapshot } from './query-snapshot';
 import {
   bindCacheRequest,
@@ -721,30 +721,36 @@ it('keeps dashboard computation independent of occupied heavy computation slots'
     await Promise.allSettled([...heavy, short]);
   }
 });
-it('keeps the dashboard computation slot bounded across concurrent requests', async () => {
+it('admits two dashboard computations and queues a third until a slot settles', async () => {
   const cache = new QueryCache();
   installAnalyticsRuntime(cache, primary, disabled());
-  let release!: () => void, began!: () => void;
-  const held = new Promise<void>(resolve => (release = resolve)),
-    started = new Promise<void>(resolve => (began = resolve));
+  const permit = { token: id, epoch: '1', lane: 'dashboard' as const };
+  const gate = await withinAnalysisPermit(permit, async () => analyticsComputationGate());
+  const releases: (() => void)[] = [];
   const run = (key: string, load: () => Promise<unknown>) =>
-    withinAnalysisPermit({ token: id, epoch: '1', lane: 'dashboard' }, () =>
-      cache.read(key, 30000, tags, load),
-    );
-  const first = run('dashboard-first', async () => {
-    began();
-    await held;
-    return 1;
-  });
-  await started;
-  const secondLoad = vi.fn(async () => 2),
-    second = run('dashboard-second', secondLoad);
+    withinAnalysisPermit(permit, () => cache.read(key, 30000, tags, load));
+  const first = run(
+    'dashboard-first',
+    () => new Promise(resolve => releases.push(() => resolve(1))),
+  );
+  const second = run(
+    'dashboard-second',
+    () => new Promise(resolve => releases.push(() => resolve(2))),
+  );
+  let third: Promise<unknown>;
+  const thirdLoad = vi.fn(async () => 3);
   try {
-    await new Promise(resolve => setTimeout(resolve, 50));
-    expect(secondLoad).not.toHaveBeenCalled();
+    await vi.waitFor(() => expect(releases).toHaveLength(2));
+    third = run('dashboard-third', thirdLoad);
+    await vi.waitFor(() => expect(gate.state).toEqual({ active: 2, queued: 1 }));
+    expect(thirdLoad).not.toHaveBeenCalled();
+    releases[0]();
+    await first;
+    await third;
+    expect(thirdLoad).toHaveBeenCalledOnce();
+    expect(gate.state).toEqual({ active: 1, queued: 0 });
   } finally {
-    release();
-    await Promise.allSettled([first, second]);
+    for (const release of releases) release();
+    await Promise.allSettled([first, second, third]);
   }
-  expect(secondLoad).toHaveBeenCalledOnce();
 });

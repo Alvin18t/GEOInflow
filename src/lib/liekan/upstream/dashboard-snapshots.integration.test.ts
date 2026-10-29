@@ -34,6 +34,14 @@ const warmResources = [
   ),
 ];
 
+const withBlockedLane = (
+  kind: Parameters<typeof withAnalysisPermit>[0],
+  work: () => Promise<unknown>,
+) =>
+  withAnalysisPermit(kind, async () => {
+    if (kind === 'dashboard') await withAnalysisPermit(kind, work);
+    else await work();
+  });
 const enabled = process.env.LIEKAN_ANALYSIS_ROLLUPS_TEST === '1';
 const actor = { id: randomUUID(), role: 'user' };
 const sites: string[] = [];
@@ -143,6 +151,106 @@ describe.skipIf(!enabled)('persistent dashboard publications in PostgreSQL', () 
     for (const id of sites) await sql('DELETE FROM website WHERE website_id=$1::uuid', id);
     await sql('DELETE FROM "user" WHERE user_id=$1::uuid', actor.id);
   });
+  it('coalesces simultaneous cold dashboard producers across authorized actors', async () => {
+    const readers = [
+      actor,
+      ...Array.from({ length: 4 }, () => ({ id: randomUUID(), role: 'admin' })),
+    ];
+    try {
+      for (const reader of readers.slice(1))
+        await sql(
+          `INSERT INTO "user"(user_id,username,password,role) VALUES($1::uuid,$1,'synthetic','admin')`,
+          reader.id,
+        );
+      const pending = await Promise.all(
+        readers.map(reader =>
+          withPublishedRegistry(() => requestDashboardSnapshot(site, reader, 'native:stats', p)),
+        ),
+      );
+      expect(pending.every(result => !result.ready)).toBe(true);
+      expect(
+        new Set(pending.map(result => (result.ready ? null : result.analysisJob.id))).size,
+      ).toBe(1);
+      const [count] = await q(
+        `SELECT count(*)::int AS n FROM liekan_analysis_query WHERE website_id=$1::uuid`,
+        site,
+      );
+      expect(count.n).toBe(1);
+      const [consumers] = await q(
+        `SELECT count(*)::int AS n FROM liekan_analysis_query_consumer c JOIN liekan_analysis_query q ON q.id=c.job_id WHERE q.website_id=$1::uuid`,
+        site,
+      );
+      expect(consumers.n).toBe(5);
+    } finally {
+      await sql('DELETE FROM liekan_analysis_query WHERE website_id=$1::uuid', site);
+      for (const reader of readers.slice(1))
+        await sql('DELETE FROM "user" WHERE user_id=$1::uuid', reader.id);
+    }
+  });
+  it.each(['same', 'other'])(
+    'reuses a cold producer that finishes between snapshot read and registration: %s actor',
+    async kind => {
+      const first = await read();
+      if (first.ready) throw new Error('expected a cold task');
+      const reader = kind === 'same' ? actor : { id: randomUUID(), role: 'admin' };
+      if (kind === 'other')
+        await sql(
+          `INSERT INTO "user"(user_id,username,password,role) VALUES($1::uuid,$1,'synthetic','admin')`,
+          reader.id,
+        );
+      const original = rollupDatabase.analysisTransaction;
+      let completed = false;
+      const spy = vi.spyOn(rollupDatabase, 'analysisTransaction').mockImplementation((async (
+        work: any,
+        level: any,
+      ) => {
+        let stale = false;
+        const result = await original(
+          tx =>
+            work(
+              new Proxy(tx, {
+                get(target, key) {
+                  if (key !== '$queryRawUnsafe') return Reflect.get(target, key);
+                  return async (statement: string, ...values: unknown[]) => {
+                    const rows = await target.$queryRawUnsafe(statement, ...values);
+                    if (
+                      !completed &&
+                      statement.includes('UPDATE liekan_dashboard_snapshot SET actor_id=')
+                    )
+                      stale = true;
+                    return rows;
+                  };
+                },
+              }),
+            ),
+          level,
+        );
+        if (stale && !completed) {
+          completed = true;
+          await finish(first.analysisJob.id);
+        }
+        return result;
+      }) as any);
+      try {
+        const second = await withPublishedRegistry(() =>
+          requestDashboardSnapshot(site, reader, 'native:stats', p),
+        );
+        expect(completed).toBe(true);
+        expect(second.ready).toBe(true);
+        expect(
+          (
+            await q(
+              'SELECT count(*)::int AS n FROM liekan_analysis_query WHERE website_id=$1::uuid',
+              site,
+            )
+          )[0].n,
+        ).toBe(1);
+      } finally {
+        spy.mockRestore();
+        if (kind === 'other') await sql('DELETE FROM "user" WHERE user_id=$1::uuid', reader.id);
+      }
+    },
+  );
   it('stops automatic replacement of exhausted work until its input changes or a reader retries', async () => {
     const pending = await read();
     if (pending.ready === true) throw new Error('expected cold dashboard');
@@ -1646,37 +1754,34 @@ describe.skipIf(!enabled)('persistent dashboard publications in PostgreSQL', () 
       await boss.start();
       try {
         await pumpAnalysisQueries(boss);
-        await withAnalysisPermit(
-          kind === 'native-heavy' ? 'interactive' : 'dashboard',
-          async () => {
-            const [delivery] = await boss.fetch<{ id: string }>(ANALYSIS_QUERY_QUEUE, {
-              includeMetadata: true,
-            });
-            expect(delivery.data.id).toBe(key);
-            if (kind === 'active-seed') {
-              expect(delivery.priority).toBe(0);
-              const joined = await read();
-              expect(joined).toMatchObject({ ready: false, analysisJob: { id: key } });
-            }
-            expect(delivery.retryLimit).toBe(10);
-            await expect(processAnalysisQueryDelivery(delivery, boss)).resolves.toBeUndefined();
-            expect(await boss.complete(ANALYSIS_QUERY_QUEUE, delivery)).toMatchObject({
-              affected: 0,
-            });
-            const [waiting] = await boss.findJobs(ANALYSIS_QUERY_QUEUE, { key, queued: true });
-            expect(waiting).toMatchObject({ state: 'retry', priority: 0, retryLimit: 10 });
-            // A stale settlement preserves a later foreground promotion of the waiting delivery.
-            await boss.update(ANALYSIS_QUERY_QUEUE, undefined, { id: delivery.id, priority: 10 });
-            await processAnalysisQueryDelivery(delivery, boss);
-            const [promoted] = await boss.findJobs(ANALYSIS_QUERY_QUEUE, { key, queued: true });
-            expect(promoted).toMatchObject({ state: 'retry', priority: 10, retryCount: 0 });
-            const [queued] = await q(
-              'SELECT status,attempts FROM liekan_analysis_query WHERE id=$1::uuid',
-              key,
-            );
-            expect(queued).toEqual({ status: 'queued', attempts: 0 });
-          },
-        );
+        await withBlockedLane(kind === 'native-heavy' ? 'interactive' : 'dashboard', async () => {
+          const [delivery] = await boss.fetch<{ id: string }>(ANALYSIS_QUERY_QUEUE, {
+            includeMetadata: true,
+          });
+          expect(delivery.data.id).toBe(key);
+          if (kind === 'active-seed') {
+            expect(delivery.priority).toBe(0);
+            const joined = await read();
+            expect(joined).toMatchObject({ ready: false, analysisJob: { id: key } });
+          }
+          expect(delivery.retryLimit).toBe(10);
+          await expect(processAnalysisQueryDelivery(delivery, boss)).resolves.toBeUndefined();
+          expect(await boss.complete(ANALYSIS_QUERY_QUEUE, delivery)).toMatchObject({
+            affected: 0,
+          });
+          const [waiting] = await boss.findJobs(ANALYSIS_QUERY_QUEUE, { key, queued: true });
+          expect(waiting).toMatchObject({ state: 'retry', priority: 0, retryLimit: 10 });
+          // A stale settlement preserves a later foreground promotion of the waiting delivery.
+          await boss.update(ANALYSIS_QUERY_QUEUE, undefined, { id: delivery.id, priority: 10 });
+          await processAnalysisQueryDelivery(delivery, boss);
+          const [promoted] = await boss.findJobs(ANALYSIS_QUERY_QUEUE, { key, queued: true });
+          expect(promoted).toMatchObject({ state: 'retry', priority: 10, retryCount: 0 });
+          const [queued] = await q(
+            'SELECT status,attempts FROM liekan_analysis_query WHERE id=$1::uuid',
+            key,
+          );
+          expect(queued).toEqual({ status: 'queued', attempts: 0 });
+        });
         let redelivery: any;
         await vi.waitFor(
           async () => {
@@ -1747,7 +1852,7 @@ describe.skipIf(!enabled)('persistent dashboard publications in PostgreSQL', () 
         if (heavy.ready === true) throw new Error('expected cold heavy fairness task');
         taskIds.push(heavy.analysisJob.id);
         await pumpAnalysisQueries(boss);
-        const held = await withAnalysisPermit(heldLane, async () => {
+        const held = await withBlockedLane(heldLane, async () => {
           await boss.work<{ id: string }>(
             ANALYSIS_QUERY_QUEUE,
             { localConcurrency: 2, batchSize: 1, pollingIntervalSeconds: 1 },
@@ -2091,6 +2196,124 @@ describe.skipIf(!enabled)('persistent dashboard publications in PostgreSQL', () 
     expect(published.n).toBe(1);
     expect(await read()).toMatchObject({ ready: true, value: { pageviews: 1 } });
   });
+  it('keeps foreground authority available during retained-history boundary reads', async () => {
+    const transaction = rollupDatabase.analysisTransaction;
+    const observer = new Client({ connectionString: process.env.DATABASE_URL });
+    await observer.connect();
+    const schema = new URL(process.env.DATABASE_URL).searchParams.get('schema');
+    let inspected = false;
+    vi.spyOn(rollupDatabase, 'analysisTransaction').mockImplementation((work, isolation) =>
+      transaction(
+        tx =>
+          work(
+            new Proxy(tx, {
+              get(target, property) {
+                if (property !== '$queryRawUnsafe') return Reflect.get(target, property);
+                return async (statement: string, ...values: unknown[]) => {
+                  if (statement.includes('SELECT min(at) AS starts,max(at) AS ends')) {
+                    inspected = true;
+                    await observer.query('BEGIN');
+                    try {
+                      await observer.query(`SET LOCAL search_path TO "${schema}"`);
+                      const authority = await observer.query(
+                        'SELECT website_id FROM liekan_analysis_site WHERE website_id=$1::uuid FOR SHARE NOWAIT',
+                        [site],
+                      );
+                      expect(authority.rowCount).toBe(1);
+                    } finally {
+                      await observer.query('ROLLBACK');
+                    }
+                  }
+                  return target.$queryRawUnsafe(statement, ...values);
+                };
+              },
+            }),
+          ),
+        isolation,
+      ),
+    );
+    try {
+      await bootstrapAnalysisHistory(Date.now(), site);
+      expect(inspected).toBe(true);
+      expect(
+        await q('SELECT id FROM liekan_analysis_build WHERE website_id=$1::uuid', site),
+      ).toHaveLength(1);
+    } finally {
+      await observer.end();
+    }
+  });
+  it.each(['epoch', 'mode', 'deleted'])(
+    'rechecks %s after an unlocked retained-history boundary read',
+    async change => {
+      const transaction = rollupDatabase.analysisTransaction;
+      let changed = false;
+      const spy = vi
+        .spyOn(rollupDatabase, 'analysisTransaction')
+        .mockImplementation((work, isolation) =>
+          transaction(
+            tx =>
+              work(
+                new Proxy(tx, {
+                  get(target, property) {
+                    if (property !== '$queryRawUnsafe') return Reflect.get(target, property);
+                    return async (statement: string, ...values: unknown[]) => {
+                      const rows = await target.$queryRawUnsafe(statement, ...values);
+                      if (
+                        !changed &&
+                        statement.includes('SELECT min(at) AS starts,max(at) AS ends')
+                      ) {
+                        changed = true;
+                        if (change === 'epoch')
+                          await sql(
+                            'UPDATE liekan_analysis_site SET epoch=epoch+1 WHERE website_id=$1::uuid',
+                            site,
+                          );
+                        else if (change === 'mode')
+                          await sql(
+                            "UPDATE liekan_analysis_site SET mode='disabled' WHERE website_id=$1::uuid",
+                            site,
+                          );
+                        else
+                          await sql(
+                            'UPDATE website SET deleted_at=clock_timestamp() WHERE website_id=$1::uuid',
+                            site,
+                          );
+                      }
+                      return rows;
+                    };
+                  },
+                }),
+              ),
+            isolation,
+          ),
+        );
+      await bootstrapAnalysisHistory(Date.now(), site);
+      expect(changed).toBe(true);
+      expect(
+        await q('SELECT id FROM liekan_analysis_build WHERE website_id=$1::uuid', site),
+      ).toHaveLength(0);
+      expect(
+        (
+          await q('SELECT archive_epoch FROM liekan_analysis_site WHERE website_id=$1::uuid', site)
+        )[0].archive_epoch,
+      ).toBeNull();
+      spy.mockRestore();
+      if (change === 'epoch') {
+        await bootstrapAnalysisHistory(Date.now(), site);
+        expect(
+          (
+            await q(
+              'SELECT epoch,archive_epoch FROM liekan_analysis_site WHERE website_id=$1::uuid',
+              site,
+            )
+          )[0],
+        ).toMatchObject({ epoch: 2n, archive_epoch: 2n });
+        expect(
+          await q('SELECT id FROM liekan_analysis_build WHERE website_id=$1::uuid', site),
+        ).toHaveLength(1);
+      }
+    },
+  );
   it('automatically registers the retained history once per site epoch', async () => {
     await bootstrapAnalysisHistory(Date.now(), site);
     const [state] = await q(

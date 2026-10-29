@@ -100,6 +100,8 @@ export interface AnalysisVisitPopulationInput {
   halfOpen?: boolean;
 }
 export interface AnalysisLogResult {
+  /** Internal cursor population identity; requested explicitly by the log reader. */
+  classificationSet?: string;
   summary: {
     requests: number;
     ai: number;

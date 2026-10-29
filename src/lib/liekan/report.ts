@@ -144,7 +144,15 @@ export async function buildReport(
     plotLogs,
   ] = await Promise.all([
     timeReportQuery('human', () =>
-      getHumanFacts(website.id, start, end, p.timezone, parts?.human as readonly HumanFact[]),
+      getHumanFacts(
+        website.id,
+        start,
+        end,
+        p.timezone,
+        parts?.human as readonly HumanFact[],
+        undefined,
+        { crawlerContext: pageOnly === true && p.resource.startsWith('ai/') },
+      ),
     ),
     timeReportQuery('logs', () =>
       getLogFacts(

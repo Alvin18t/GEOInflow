@@ -1,6 +1,8 @@
 import { applyHumanFactsPopulation } from '../contracts/population-results';
 import { identityUsable, unavailableFields } from '../contracts/browser-population';
-import { readBrowserPopulation } from './browser-population';
+import { applyNativePopulation, readBrowserPopulation } from './browser-population';
+import { readAnalysisVisitContext } from './analysis-rollups';
+import { noteBrowserPopulation } from './cache-context';
 import { nativeSnapshot } from './native-snapshot';
 import { funnelParametersSchema } from '@/lib/analytics-schema';
 import { getPostgresCountrySQL, getPostgresRegionSQL } from '@/lib/country';
@@ -169,6 +171,7 @@ export async function getHumanFacts(
   timezone: string,
   fields?: readonly HumanFact[],
   geographyReadLimit?: { rows: number; bytes: number },
+  projection?: { crawlerContext?: boolean },
 ) {
   const args: unknown[] = [id, start, end, timezone];
   const selected = new Set(fields);
@@ -192,14 +195,24 @@ export async function getHumanFacts(
     newVisitors: ` SELECT count(distinct v.session_id)::int AS count FROM visits v JOIN (TABLE session) s ON s.session_id=v.session_id AND s.website_id=$1::uuid WHERE s.created_at BETWEEN $2 AND $3`,
     dailyConversions: ` SELECT to_char(created_at AT TIME ZONE $4,'YYYY-MM-DD') AS day,count(distinct event_id)::int AS count FROM matches GROUP BY 1 ORDER BY 1`,
   };
-  const detail = await readBrowserDetailFacts(
-    id,
-    start,
-    end,
-    timezone,
-    Object.keys(statements).filter(key => needs(key as HumanFact)),
-    { geographyReadLimit },
+  // Crawler pages consume date labels and exact presence; detailed daily metrics retain their own reader.
+  const context =
+    projection?.crawlerContext && fields && fields.every(field => field === 'daily' || field === 'pages')
+      ? await readAnalysisVisitContext({ websiteId: id, startDate: start, endDate: end, timezone })
+      : null;
+  if (context) noteBrowserPopulation(id, context.population);
+  const detailFields = Object.keys(statements).filter(
+    key => needs(key as HumanFact) && !(context && key === 'daily'),
   );
+  const detailed = await readBrowserDetailFacts(id, start, end, timezone, detailFields, {
+    geographyReadLimit,
+  });
+  const detail = context
+    ? {
+        ...detailed,
+        ...(selected.has('daily') ? { daily: context.dates.map(day => ({ day })) } : {}),
+      }
+    : detailed;
   const remaining = Object.entries(statements).filter(
     ([key]) => needs(key as HumanFact) && !Object.hasOwn(detail || {}, key),
   );
@@ -222,7 +235,11 @@ export async function getHumanFacts(
   if (geographyReadLimit && needs('geo') && !detail?.geo)
     args.push(geographyReadLimit.rows, geographyReadLimit.bytes);
   const [totals, definitions, current, previousSources, previousGoals] = await Promise.all([
-    humanTotals(id, start, end, timezone),
+    context
+      ? Promise.resolve(
+          applyNativePopulation([context.totals], 'getWebsiteStats', context.population)[0],
+        )
+      : humanTotals(id, start, end, timezone),
     query(
       "SELECT report_id AS id,name,type,parameters FROM report WHERE website_id=$1::uuid AND type IN('goal','funnel') ORDER BY created_at LIMIT 100",
       id,

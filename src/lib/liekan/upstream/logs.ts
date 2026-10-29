@@ -97,8 +97,25 @@ async function readLogFacts(
           id,
         )
       : [];
-  const [cursorClassification] =
-    metrics.crawlerMetricsVersion === 1 && (!fields || fields.includes('recent'))
+  const acceleratedClassification =
+    metrics.crawlerMetricsVersion === 1 &&
+    (!fields || fields.includes('recent')) &&
+    !filter &&
+    !search &&
+    /^[a-f0-9-]{36}$/i.test(id)
+      ? await readAnalysisLogRollup({
+          websiteId: id,
+          startDate: start,
+          endDate: end,
+          timezone,
+          crawlerMetricsVersion: 1,
+          crawlerIdentityScope: metrics.crawlerIdentityScope,
+          fields: ['classificationSet'],
+        })
+      : null;
+  const [cursorClassification] = acceleratedClassification
+    ? [{ versions: acceleratedClassification.classificationSet }]
+    : metrics.crawlerMetricsVersion === 1 && (!fields || fields.includes('recent'))
       ? await q(
           `SELECT coalesce(string_agg(DISTINCT l.reporting_classification_version,','),'legacy') AS versions ${identityBase}${filterSql}`,
         )
@@ -252,6 +269,31 @@ async function readLogFacts(
   } = aggregates[0] ?? {};
   for (const row of bots) if (row.lastVisit) row.lastVisit = new Date(row.lastVisit);
   for (const row of pages) if (row.lastCrawled) row.lastCrawled = new Date(row.lastCrawled);
+  const previousStart = new Date(
+    Math.max(0, +start - (+end - +start + (metrics.crawlerMetricsVersion === 1 ? 0 : 1))),
+  );
+  const previousEnd = new Date(+start - (metrics.crawlerMetricsVersion === 1 ? 0 : 1));
+  const previousRollup =
+    needs('previousBots') && withForms && /^[a-f0-9-]{36}$/i.test(id)
+      ? await readAnalysisLogRollup({
+          websiteId: id,
+          startDate: previousStart,
+          endDate: previousEnd,
+          timezone,
+          crawlerMetricsVersion: metrics.crawlerMetricsVersion,
+          crawlerIdentityScope: metrics.crawlerIdentityScope,
+          fields: ['bots'],
+          filters: {
+            resource: metrics.resource,
+            botProductForm: metrics.botProductForm,
+            botCategory: metrics.botCategory,
+          },
+        })
+      : null;
+  const previousBots = previousRollup?.bots.map(row => ({
+    ...row,
+    lastVisit: row.lastVisit ? new Date(row.lastVisit) : row.lastVisit,
+  }));
   return {
     summary: summary[0],
     daily,
@@ -266,25 +308,21 @@ async function readLogFacts(
     nextCursor: recent.length ? encodeCursor(recent.at(-1), cursorScope) : '',
     previousCursor: page > 1 && recent.length ? encodeCursor(recent[0], cursorScope) : '',
     totalLogs: count[0].count,
-    previousBots: needs('previousBots')
-      ? await read(
-          withForms
-            ? formBots
-            : `SELECT bot AS name,vendor,bot_type AS type,l.reporting_crawler_id AS "botId",count(*)::int AS requests FROM liekan_reporting_log l LEFT JOIN liekan_crawler_evidence e ON e.website_id=l.website_id AND e.log_id=l.id WHERE l.website_id=$1::uuid AND ${timeCondition}${identityScope} GROUP BY 1,2,3,4`,
-          id,
-          new Date(
-            Math.max(
-              0,
-              start.getTime() -
-                (end.getTime() - start.getTime() + (metrics.crawlerMetricsVersion === 1 ? 0 : 1)),
-            ),
-          ),
-          new Date(start.getTime() - (metrics.crawlerMetricsVersion === 1 ? 0 : 1)),
-          ...(withForms
-            ? [timezone, metrics.botProductForm ?? null, metrics.botCategory ?? null]
-            : []),
-        )
-      : [],
+    previousBots:
+      previousBots ??
+      (needs('previousBots')
+        ? await read(
+            withForms
+              ? formBots
+              : `SELECT bot AS name,vendor,bot_type AS type,l.reporting_crawler_id AS "botId",count(*)::int AS requests FROM liekan_reporting_log l LEFT JOIN liekan_crawler_evidence e ON e.website_id=l.website_id AND e.log_id=l.id WHERE l.website_id=$1::uuid AND ${timeCondition}${identityScope} GROUP BY 1,2,3,4`,
+            id,
+            previousStart,
+            previousEnd,
+            ...(withForms
+              ? [timezone, metrics.botProductForm ?? null, metrics.botCategory ?? null]
+              : []),
+          )
+        : []),
   };
 }
 export async function getLogToday(id: string, start: Date, end: Date) {

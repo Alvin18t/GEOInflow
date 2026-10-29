@@ -2,6 +2,8 @@ import { randomUUID } from 'node:crypto';
 import {
   type AnalysisPermit,
   analysisPermitTable,
+  analysisPermitPredicate,
+  analysisPermitValues,
   withinAnalysisPermit,
 } from './analysis-permit-context';
 import { analysisCapacity, analysisTransaction } from './analysis-rollups-db';
@@ -19,21 +21,24 @@ export async function withAnalysisPermit<T>(
   const table = analysisPermitTable({
     token,
     epoch: '',
-    ...(kind === 'dashboard' ? { lane: 'dashboard' as const } : {}),
+    ...(kind === 'dashboard' ? { lane: 'dashboard' as const, slot: 1 } : {}),
   });
-  const acquired = await analysisTransaction(async tx => {
-    if (kind === 'dashboard') {
+  const acquired = await analysisTransaction<{ epoch: bigint; slot?: number } | undefined>(
+    async tx => {
+      if (kind === 'dashboard') {
+        const [row] = await tx.$queryRawUnsafe<{ epoch: bigint; slot: number }[]>(
+          `WITH available AS(SELECT slot FROM liekan_analysis_read_lease
+         WHERE lease_until IS NULL OR lease_until<=clock_timestamp() ORDER BY slot FOR UPDATE SKIP LOCKED LIMIT 1)
+         UPDATE liekan_analysis_read_lease SET token=$1::uuid,epoch=epoch+1,
+          lease_until=clock_timestamp()+interval '90 seconds' WHERE slot IN(SELECT slot FROM available)
+          AND NOT EXISTS(SELECT 1 FROM liekan_analysis_dashboard_lease WHERE lease_until>clock_timestamp())
+          RETURNING epoch,slot`,
+          token,
+        );
+        return row;
+      }
       const [row] = await tx.$queryRawUnsafe<{ epoch: bigint }[]>(
-        `WITH slot AS(SELECT id FROM liekan_analysis_dashboard_lease WHERE id FOR UPDATE SKIP LOCKED)
-         UPDATE liekan_analysis_dashboard_lease SET token=$1::uuid,epoch=epoch+1,
-         lease_until=clock_timestamp()+interval '90 seconds'
-         WHERE id IN(SELECT id FROM slot) AND (lease_until IS NULL OR lease_until<=clock_timestamp()) RETURNING epoch`,
-        token,
-      );
-      return row;
-    }
-    const [row] = await tx.$queryRawUnsafe<{ epoch: bigint }[]>(
-      `WITH slot AS(SELECT id FROM liekan_analysis_background_lease WHERE id FOR UPDATE SKIP LOCKED)
+        `WITH slot AS(SELECT id FROM liekan_analysis_background_lease WHERE id FOR UPDATE SKIP LOCKED)
        UPDATE liekan_analysis_background_lease SET token=$1::uuid,epoch=epoch+1,
        lease_until=clock_timestamp()+interval '90 seconds',
        interactive_turns=CASE WHEN $2='interactive' THEN interactive_turns+1 WHEN $2='history' THEN 0 ELSE interactive_turns END,
@@ -49,11 +54,12 @@ export async function withAnalysisPermit<T>(
           AND NOT EXISTS(SELECT 1 FROM liekan_geo_weight_head WHERE task_status IN('queued','running'))
           AND incremental_waiting_at IS NULL AND history_waiting_at IS NULL)
        RETURNING epoch`,
-      token,
-      kind,
-    );
-    return row;
-  });
+        token,
+        kind,
+      );
+      return row;
+    },
+  );
   if (!acquired) return { acquired: false as const };
   let owned = true,
     renewing = false;
@@ -64,9 +70,8 @@ export async function withAnalysisPermit<T>(
       owned = !!(await analysisTransaction(tx =>
         tx.$executeRawUnsafe(
           `UPDATE ${table} SET lease_until=clock_timestamp()+interval '90 seconds'
-         WHERE id AND token=$1::uuid AND epoch=$2::bigint AND lease_until>clock_timestamp()`,
-          token,
-          acquired.epoch,
+         WHERE ${analysisPermitPredicate(lease)} AND lease_until>clock_timestamp()`,
+          ...analysisPermitValues(lease),
         ),
       ));
     } catch {
@@ -78,7 +83,7 @@ export async function withAnalysisPermit<T>(
   const lease: AnalysisPermit = {
     token,
     epoch: String(acquired.epoch),
-    ...(kind === 'dashboard' ? { lane: 'dashboard' as const } : {}),
+    ...(kind === 'dashboard' ? { lane: 'dashboard' as const, slot: acquired.slot } : {}),
   };
   try {
     return {
@@ -98,9 +103,8 @@ export async function withAnalysisPermit<T>(
         waiting = `,incremental_waiting_at=${analysisBuildWaitingSql.incremental}`;
       }
       await tx.$executeRawUnsafe(
-        `UPDATE ${table} SET token=NULL,lease_until=NULL${waiting} WHERE id AND token=$1::uuid AND epoch=$2::bigint`,
-        token,
-        acquired.epoch,
+        `UPDATE ${table} SET token=NULL,lease_until=NULL${waiting} WHERE ${analysisPermitPredicate(lease)}`,
+        ...analysisPermitValues(lease),
       );
     });
   }

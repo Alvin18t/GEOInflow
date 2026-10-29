@@ -15,6 +15,14 @@ import * as rollupDatabase from './analysis-rollups-db';
 import { withAnalysisPermit } from './analysis-background';
 import { requestDashboardSnapshot } from './dashboard-snapshots';
 import { Client } from 'pg';
+const withBlockedLane = (
+  kind: Parameters<typeof withAnalysisPermit>[0],
+  work: () => Promise<unknown>,
+) =>
+  withAnalysisPermit(kind, async () => {
+    if (kind === 'dashboard') await withAnalysisPermit(kind, work);
+    else await work();
+  });
 const enabled = process.env.LIEKAN_ANALYSIS_ROLLUPS_TEST === '1';
 const actor = { id: randomUUID(), role: 'user' },
   other = { id: randomUUID(), role: 'user' };
@@ -685,7 +693,7 @@ describe.skipIf(!enabled)('durable private query lifecycle in PostgreSQL', () =>
     const send = vi.fn().mockResolvedValue('delivered');
     await pumpAnalysisQueries({ send, update: vi.fn() });
     expect(send.mock.calls.some(([, data]) => data.id === task.analysisJob.id)).toBe(true);
-    await withAnalysisPermit('dashboard', async () => {
+    await withBlockedLane('dashboard', async () => {
       expect((await processAnalysisQuery(task.analysisJob.id)).acquired).toBe(false);
     });
     const [row] = await q(
